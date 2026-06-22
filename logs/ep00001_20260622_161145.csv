@@ -1,0 +1,1 @@
+step,speedX,speedY,angle,trackPos,distFromStart,distRaced,steer,accel,brake,gear,r_speed,r_safety,r_ttc,r_terminal,reward_total,terminal_reason

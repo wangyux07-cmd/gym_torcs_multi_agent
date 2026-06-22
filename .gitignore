@@ -1,0 +1,19 @@
+# Python virtual environment - never commit this, it's huge and
+# regenerable via `pip install -r requirements.txt`
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Training artifacts - large, regenerable, and personal to each run
+checkpoints/
+tb_logs/
+logs/
+demos.npz
+
+# OS-specific files
+.DS_Store
+Thumbs.db
