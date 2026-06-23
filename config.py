@@ -18,6 +18,11 @@ REWARD_WEIGHTS = {
     "w_safety":  1.0,   # Weight for track-edge / opponent proximity penalty (raised from 0.5)
     "w_ttc":     0.0,   # Weight for Time-to-Collision penalty (0 = off for single-car)
     "w_smooth":  0.3,   # Weight for steering-smoothness penalty (new)
+    # New: penalizes maintaining high speed when the front-facing sensors
+    # show the track narrowing ahead (i.e. a corner approaching). Started
+    # conservative (0.3) -- this is a new, untested signal, so we don't
+    # want it to dominate w_speed while we observe its effect.
+    "w_anticipation": 0.3,
 }
 
 # ===================== Reward Detail Parameters =====================
@@ -43,6 +48,21 @@ REWARD_PARAMS = {
     "out_of_track_penalty": -50.0,
     "stuck_penalty": -50.0,
     "backward_penalty": -50.0,
+    # New: detected via the 'damage' sensor rising between steps, which is
+    # a direct physics-engine signal independent of trackPos geometry.
+    # This was added after log analysis showed a high-speed impact
+    # (92.7 -> 58.5 km/h in a single step) that trackPos never flagged as
+    # out-of-track at this track's geometry -- the car kept dragging
+    # itself for ~100 more steps with no termination signal at all.
+    "collision_penalty": -50.0,
+    # Anticipation reward parameters (see _compute_anticipation_reward).
+    # The track[] sensors span -90deg to +90deg in 10deg steps (index 0
+    # to 18); index 9 is straight ahead. Indices 6-12 cover -30deg to
+    # +30deg, a forward-facing cone wide enough to catch an approaching
+    # corner without being thrown off by sensors pointed too far sideways.
+    "anticipation_sensor_indices": list(range(6, 13)),
+    "anticipation_speed_per_meter": 1.0,   # km/h of "safe speed" allowed per meter of forward clearance
+    "anticipation_max_safe_speed": 200.0,  # Cap so long straights don't get penalized
     "lap_complete_bonus": 50.0,  # Will be recalibrated once laps are reliably completed
 }
 

@@ -13,7 +13,7 @@ Architecture overview:
     PPO agent (stable-baselines3, separate training script)
 
 Design decisions:
-    - Windows-native: no os.system('pkill'), no shell scripts.
+    - Windows-native
       You start TORCS manually before running the training script.
     - 65-dim state vector: same structure for single-car and multi-car.
       Single-car fills opponent sensors with max-range values (200m).
@@ -217,7 +217,14 @@ class TorcsEnv(gym.Env):
 
         # --- Reset episode state ---
         self.time_step = 0
-        self.prev_obs_raw = raw_obs
+        # IMPORTANT: must copy, not alias. self.client.S.d is mutated
+        # in place by snakeoil3's parse_server_str() on every frame, so
+        # storing a bare reference here would make prev_obs_raw silently
+        # track the SAME dict as the current obs on the next step,
+        # permanently breaking any "did this value change?" comparison
+        # (this is exactly what made damage-based collision detection
+        # never fire, despite damage clearly rising in the logs).
+        self.prev_obs_raw = dict(raw_obs)
         self.prev_dist_from_start = raw_obs.get("distFromStart", 0)
         self.prev_steer = None
         self.wall_pinned_counter = 0
@@ -341,7 +348,10 @@ class TorcsEnv(gym.Env):
             self._close_episode_log()
 
         # ------ 10. Advance internal state ------
-        self.prev_obs_raw = raw_obs
+        # Must copy (see note in reset()): client.S.d is mutated in place,
+        # so storing a bare reference here makes prev_obs_raw silently
+        # become the SAME object as next step's raw_obs.
+        self.prev_obs_raw = dict(raw_obs)
         self.time_step += 1
 
         info = {
@@ -446,7 +456,8 @@ class TorcsEnv(gym.Env):
         Compute the composite per-step reward.
 
         R_total = w_speed * R_speed + w_safety * R_safety + w_ttc * R_ttc
-                  + w_smooth * R_smooth + time_penalty
+                  + w_smooth * R_smooth + w_anticipation * R_anticipation
+                  + time_penalty
 
         The time_penalty is a flat, unweighted constant applied every step
         (see config.py REWARD_PARAMS["time_penalty"] for why).
@@ -457,17 +468,19 @@ class TorcsEnv(gym.Env):
         """
         w = config.REWARD_WEIGHTS
 
-        r_speed  = self._compute_speed_reward(obs)
-        r_safety = self._compute_safety_reward(obs)
-        r_ttc    = self._compute_ttc_reward(obs)
-        r_smooth = self._compute_smoothness_reward(steer)
-        r_time   = config.REWARD_PARAMS["time_penalty"]
+        r_speed        = self._compute_speed_reward(obs)
+        r_safety       = self._compute_safety_reward(obs)
+        r_ttc          = self._compute_ttc_reward(obs)
+        r_smooth       = self._compute_smoothness_reward(steer)
+        r_anticipation = self._compute_anticipation_reward(obs)
+        r_time         = config.REWARD_PARAMS["time_penalty"]
 
         total = (
             w["w_speed"]  * r_speed
             + w["w_safety"] * r_safety
             + w["w_ttc"]    * r_ttc
             + w["w_smooth"] * r_smooth
+            + w["w_anticipation"] * r_anticipation
             + r_time
         )
 
@@ -476,6 +489,7 @@ class TorcsEnv(gym.Env):
             "r_safety": r_safety,
             "r_ttc":    r_ttc,
             "r_smooth": r_smooth,
+            "r_anticipation": r_anticipation,
             "r_time":   r_time,
         }
         return total, info
@@ -566,6 +580,45 @@ class TorcsEnv(gym.Env):
         k = config.REWARD_PARAMS["smoothness_k"]
         return -k * delta
 
+    def _compute_anticipation_reward(self, obs):
+        """
+        Penalizes maintaining high speed when the front-facing distance
+        sensors show the track narrowing ahead (an approaching corner).
+
+        Logic:
+            1. Look at a forward-facing cone of sensors (indices 6-12,
+               i.e. -30deg to +30deg) and take the MINIMUM reading --
+               the most conservative estimate of how much open track is
+               ahead before something (a wall, a corner) gets close.
+            2. Convert that distance into a "safe speed" estimate:
+               more clearance = higher safe speed, capped at a maximum
+               so long straights are never penalized.
+            3. If current speed exceeds that safe estimate, penalize the
+               excess. If not, this term is zero -- it never tells the
+               agent HOW to brake or steer, only that going this fast
+               with this little clearance ahead is undesirable.
+
+        Added after log analysis showed the car repeatedly entering
+        corners at near-maximum speed (e.g. accelerating to 180 km/h
+        on the very first corner) with no signal discouraging this,
+        since instantaneous safety reward only fires once already near
+        the track edge -- often too late to avoid a collision.
+        """
+        p = config.REWARD_PARAMS
+        track = obs.get("track", [200.0] * 19)
+        indices = p["anticipation_sensor_indices"]
+        sensors = [track[i] for i in indices if i < len(track)]
+        forward_distance = min(sensors) if sensors else 200.0
+
+        safe_speed = min(
+            forward_distance * p["anticipation_speed_per_meter"],
+            p["anticipation_max_safe_speed"],
+        )
+
+        speed_x = obs.get("speedX", 0.0)
+        excess = max(0.0, speed_x - safe_speed)
+        return -excess
+
     # ============================================================
     #  Reward: terminal (one-time, applied when episode ends)
     # ============================================================
@@ -577,7 +630,9 @@ class TorcsEnv(gym.Env):
         """
         p = config.REWARD_PARAMS
 
-        if reason == "out_of_track":
+        if reason == "collision":
+            return p["collision_penalty"]
+        elif reason == "out_of_track":
             return p["out_of_track_penalty"]
         elif reason == "stuck" or reason == "wall_pinned":
             return p["stuck_penalty"]
@@ -601,6 +656,19 @@ class TorcsEnv(gym.Env):
             truncated:  bool -- ended by step limit
             reason:     str  -- human-readable label for logging / analysis
         """
+        # --- Collision (damage-based, checked first) ---
+        # Direct physics-engine signal: TORCS increments 'damage' whenever
+        # the car hits something, regardless of where the impact happens
+        # geometrically. This catches impacts that trackPos misses -- log
+        # analysis found a high-speed hit (92.7 -> 58.5 km/h in one step)
+        # at a track location where trackPos never crossed the
+        # out-of-track threshold, leaving the car to drag itself for ~100
+        # more undetected steps before the generic stuck check finally
+        # ended the episode.
+        prev_damage = self.prev_obs_raw.get("damage", 0.0) if self.prev_obs_raw else 0.0
+        if obs.get("damage", 0.0) - prev_damage > 0:
+            return True, False, "collision"
+
         # --- Out of track ---
         if abs(obs.get("trackPos", 0.0)) > 1.0:
             return True, False, "out_of_track"
@@ -691,11 +759,11 @@ class TorcsEnv(gym.Env):
             "step",
             # Raw sensor readings (for trajectory / behavior analysis)
             "speedX", "speedY", "angle", "trackPos",
-            "distFromStart", "distRaced",
+            "distFromStart", "distRaced", "damage",
             # Actions taken by the agent
             "steer", "accel", "brake", "gear",
             # Reward breakdown (for ablation comparison)
-            "r_speed", "r_safety", "r_ttc", "r_smooth", "r_time", "r_terminal", "reward_total",
+            "r_speed", "r_safety", "r_ttc", "r_smooth", "r_anticipation", "r_time", "r_terminal", "reward_total",
             # Episode event
             "terminal_reason",
         ])
@@ -713,6 +781,7 @@ class TorcsEnv(gym.Env):
             raw_obs.get("trackPos", 0),
             raw_obs.get("distFromStart", 0),
             raw_obs.get("distRaced", 0),
+            raw_obs.get("damage", 0),
             float(action[0]),
             float(action[1]),
             float(action[2]),
@@ -721,6 +790,7 @@ class TorcsEnv(gym.Env):
             reward_info.get("r_safety", 0),
             reward_info.get("r_ttc", 0),
             reward_info.get("r_smooth", 0),
+            reward_info.get("r_anticipation", 0),
             reward_info.get("r_time", 0),
             reward_info.get("terminal", 0),
             reward,
@@ -852,7 +922,7 @@ class TorcsEnv(gym.Env):
         # log file just stopped with no terminal_reason at all).
         if self._log_writer is not None:
             self._log_writer.writerow(
-                [self.time_step] + [""] * 17 + ["training_stopped"]
+                [self.time_step] + [""] * 19 + ["training_stopped"]
             )
         self._close_episode_log()
         self._disconnect()

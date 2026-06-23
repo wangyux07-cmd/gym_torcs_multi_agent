@@ -1,0 +1,7 @@
+param,value,ep_len_mean,ep_rew_mean,backward,collision,out_of_track,stuck
+w_anticipation,0.15,667.4565217391304,14203.716532021737,1,9,4,32
+w_anticipation,0.3,496.5245901639344,573.0222076393444,1,2,2,57
+w_anticipation,0.6,639.6808510638298,10407.820763382979,1,3,4,1,39
+anticipation_speed_per_meter,0.6,567.3461538461538,4621.80874125,1,2,5,2,43
+anticipation_speed_per_meter,1.0,473.890625,2809.98767525,1,2,15,2,42,3
+anticipation_speed_per_meter,1.5,572.6538461538462,7470.80368026923,1,1,2,2,47
