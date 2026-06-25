@@ -1,0 +1,18 @@
+==================================================
+  TRAINING SUMMARY (289 episodes)
+==================================================
+  Avg episode length:   694 steps
+  Avg total reward:     45552.1
+  Avg reward std:       31.34
+  Avg speed:            70.0 km/h
+  Max speed seen:       184.6 km/h
+  Avg distance raced:   305 m
+  Avg trackPos |dev|:   0.325
+  Avg steering jitter:  0.5720
+  Terminal reasons:
+    backward            :    7  (2.4%)
+    collision           :   10  (3.5%)
+    out_of_track        :  221  (76.5%)
+    stuck               :   50  (17.3%)
+    training_stopped    :    1  (0.3%)
+==================================================
