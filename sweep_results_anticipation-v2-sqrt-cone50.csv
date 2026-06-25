@@ -1,0 +1,4 @@
+w_anticipation,anticipation_speed_per_sqrt_meter,ep_len_mean,ep_rew_mean,avg_speed,(empty),backward,collision,lap_complete,out_of_track,stuck,wall_pinned
+0.15,8.0,895.49,72805.64958417999,73.28262983589121,1,12,4,0,187,28,0
+0.15,12.0,1045.9,89312.55637913,75.04716640888336,1,6,10,0,135,49,0
+0.15,16.0,701.97,51545.07463153,62.784946053285616,1,16,8,0,236,49,0
