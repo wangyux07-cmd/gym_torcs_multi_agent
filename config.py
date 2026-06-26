@@ -32,7 +32,7 @@ REWARD_WEIGHTS = {
     # scope confirmed with supervisor, TTC's car-to-car use case
     # doesn't apply). Default left at the grid-search value currently
     # being tested; sweep.py overrides this per-run regardless.
-    "w_anticipation": 0.3,
+    "w_anticipation": 0.15,
 }
 
 # ===================== Reward Detail Parameters =====================
@@ -48,6 +48,24 @@ REWARD_PARAMS = {
     # trackPos=0.95 now gets penalized far more harshly than one merely
     # touching the margin at trackPos=0.65.
     "lateral_penalty_k": 0.5,   # Coefficient penalizing lateral snaking in R_speed
+    # Speed x trackPos deviation term, added after reviewing TORCS-RL
+    # literature (Wang, Jia & Weng 2018, arXiv:1811.11329 -- TORCS+DDPG,
+    # designs own reward to "stick to center of road"; similar
+    # speed-scaled deviation terms also appear in other racing-RL
+    # papers). The existing squared safety penalty above only depends
+    # on position (same penalty whether drifting at 20 km/h or 150
+    # km/h at the same trackPos); this term scales the deviation
+    # penalty by current speed, so high-speed drifting is penalized
+    # more than slow drifting -- complementary to (not redundant
+    # with) the existing position-only penalty and the angle-based
+    # lateral term already in _compute_speed_reward (that one penalizes
+    # heading-angle mismatch, not positional offset).
+    # NOTE: exact coefficient from the cited paper not independently
+    # verified -- this starting value (0.005) was sized so a typical
+    # high-speed deviation (speed=70, trackPos=0.5) produces a modest
+    # penalty (~0.18) that doesn't yet dominate R_speed; treat as a
+    # starting point to observe and adjust, not a literature-exact value.
+    "safety_speed_beta": 0.005,
     # Steering smoothness: penalizes large frame-to-frame changes in the
     # steering action. This directly targets the "jerky driving" and
     # "oversteers into the wall while correcting" behavior observed in
@@ -208,7 +226,7 @@ PPO_PARAMS = {
 
 # ===================== Training Run Settings =====================
 TRAINING = {
-    "total_timesteps": 200_000,   # Overall training budget for this run
+    "total_timesteps": 400_000,   # Overall training budget for this run
     "checkpoint_freq": 5_000,     # Save a checkpoint every N timesteps
     "checkpoint_dir": "./checkpoints",
     "model_save_path": "./checkpoints/torcs_ppo_final",

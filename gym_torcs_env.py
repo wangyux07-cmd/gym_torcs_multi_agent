@@ -521,20 +521,40 @@ class TorcsEnv(gym.Env):
     def _compute_safety_reward(self, obs):
         """
         Single-car stage:
-            R_safety = -max(0, |trackPos| - safety_margin) ** 2
-            Squared (not linear) so the penalty grows much faster as the
-            car gets closer to the edge -- this discourages "wall-riding"
-            at a constant offset, which a linear penalty failed to do.
+            R_safety = -max(0, |trackPos| - safety_margin)^2
+                       - beta * speedX * |trackPos|
+
+            The first term (squared margin penalty, unchanged) fires
+            only once the car is meaningfully off-center, and grows
+            fast as it gets closer to the edge.
+
+            The second term (speed x deviation, new) is always active,
+            scaling the deviation penalty by current speed -- drifting
+            off-center at high speed is penalized more than drifting at
+            low speed, even before crossing the safety_margin threshold.
+            Added based on a TORCS-RL literature pattern (see config.py
+            REWARD_PARAMS comment for the citation and caveats); this
+            complements the angle-based lateral term already in
+            _compute_speed_reward (heading mismatch) and the
+            forward-clearance-based anticipation term (distance ahead)
+            -- three different signals, not redundant with each other.
 
         Multi-car stage (future):
             Will be extended to incorporate opponent proximity penalty.
         """
         track_pos = abs(obs.get("trackPos", 0.0))
+        speed_x   = obs.get("speedX", 0.0)
         margin    = config.REWARD_PARAMS["safety_margin"]
+        beta      = config.REWARD_PARAMS["safety_speed_beta"]
 
         if track_pos > margin:
-            return -((track_pos - margin) ** 2)
-        return 0.0
+            boundary_penalty = -((track_pos - margin) ** 2)
+        else:
+            boundary_penalty = 0.0
+
+        speed_deviation_penalty = -beta * speed_x * track_pos
+
+        return boundary_penalty + speed_deviation_penalty
 
     # ============================================================
     def _compute_smoothness_reward(self, steer):
