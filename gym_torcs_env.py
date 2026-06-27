@@ -582,11 +582,14 @@ class TorcsEnv(gym.Env):
         sensors show the track narrowing ahead (an approaching corner).
 
         Logic:
-            1. Look at a forward-facing cone of sensors (now -50deg to
-               +50deg, widened from an earlier -30/+30 cone -- see
-               config.py REWARD_PARAMS comment for why) and take the
-               MINIMUM reading -- the most conservative estimate of how
-               much open track is ahead.
+            1. Look across the sensor sweep (now the FULL -90deg to
+               +90deg range, all 19 sensors -- widened again from an
+               earlier -50/+50 cone specifically to catch hairpin
+               turns, where the apex wall first appears at wide angles
+               while center sensors still read open track down the
+               corner's "throat") and take the MINIMUM reading -- the
+               most conservative estimate of how much open track is
+               ahead.
             2. Convert that distance into a "safe speed" estimate using
                a sqrt relationship (safe_speed = k * sqrt(distance)),
                grounded in centripetal force physics: max cornering

@@ -40,13 +40,15 @@ from train import make_env
 
 
 def find_param_dict(param_name):
-    """Figure out whether the parameter lives in REWARD_WEIGHTS or REWARD_PARAMS."""
+    """Figure out whether the parameter lives in REWARD_WEIGHTS, REWARD_PARAMS, or PPO_PARAMS."""
     if param_name in config.REWARD_WEIGHTS:
         return config.REWARD_WEIGHTS
     if param_name in config.REWARD_PARAMS:
         return config.REWARD_PARAMS
+    if param_name in config.PPO_PARAMS:
+        return config.PPO_PARAMS
     raise ValueError(
-        f"'{param_name}' not found in REWARD_WEIGHTS or REWARD_PARAMS."
+        f"'{param_name}' not found in REWARD_WEIGHTS, REWARD_PARAMS, or PPO_PARAMS."
     )
 
 

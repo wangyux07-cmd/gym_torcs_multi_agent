@@ -87,17 +87,17 @@ REWARD_PARAMS = {
     # The track[] sensors span -90deg to +90deg in 10deg steps (index 0
     # to 18); index 9 is straight ahead.
     #
-    # Widened from indices 6-12 (-30 to +30 deg) to 4-14 (-50 to +50
-    # deg): the narrow cone meant the car often couldn't "see" a sharp
-    # corner until its own heading had already turned partway into it,
-    # since sensors point along the car's current heading, not along
-    # the track's future curvature. By the time the forward-center
-    # sensors detected the shortening distance, there often wasn't
-    # enough time left to turn -- diagnosed from grid search data
-    # showing out_of_track as the dominant failure mode (~70%), far
-    # exceeding collision (~5%), and raising w_safety made it WORSE
-    # rather than better -- pointing at a detection-timing problem,
-    # not a penalty-magnitude problem.
+    # Reverted from the full 0-18 (-90/+90 deg) sweep back to 4-14
+    # (-50/+50 deg): the wider sweep was tested and did NOT improve
+    # results -- out_of_track rose from 66.8% to 75.2% overall, and
+    # the specific hairpin it was meant to help (Hairpin 2,
+    # ~1200-1350m) got WORSE under it (only 22.2% passed safely vs
+    # needing further diagnosis). Likely cause: wide-angle side
+    # sensors triggered unnecessary slowdowns on ordinary track
+    # sections, creating new instability rather than helping at the
+    # one hairpin it targeted. Going back to the narrower, previously
+    # working range while other variables (ent_coef, smoothness_k)
+    # are investigated instead.
     "anticipation_sensor_indices": list(range(4, 15)),
     # Switched from a linear mapping (safe_speed = distance * k) to a
     # sqrt mapping, based on centripetal force physics: the maximum
