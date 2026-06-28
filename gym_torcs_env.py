@@ -82,7 +82,6 @@ NORM = {
     "track":        200.0,     # meters (19 range-finder sensors)
     "wheelSpinVel": 100.0,     # rad/s (4 wheels)
     "rpm":          10000.0,   # engine revolutions per minute
-    "opponents":    200.0,     # meters (36 opponent sensors)
 }
 
 # Rule-based gear shifting thresholds (km/h).
@@ -162,7 +161,6 @@ class TorcsEnv(gym.Env):
         self.time_step = 0          # Steps elapsed in current episode
         self.prev_obs_raw = None    # Previous frame's raw sensor dict
         self.prev_steer = None      # Previous step's steer action (for smoothness penalty)
-        self.prev_progress_potential = None  # Previous step's progress potential (for R_progress shaping)
         self.wall_pinned_counter = 0  # Consecutive steps spent jammed against the wall (for termination)
         self.out_of_track_counter = 0  # Consecutive steps off-track (grace period before termination)
         self.in_track_streak = 0       # Consecutive steps back IN bounds (must sustain this to clear the counter)
@@ -243,7 +241,6 @@ class TorcsEnv(gym.Env):
         self.prev_obs_raw = dict(raw_obs)
         self.prev_dist_from_start = raw_obs.get("distFromStart", 0)
         self.prev_steer = None
-        self.prev_progress_potential = None
         self.wall_pinned_counter = 0
         self.out_of_track_counter = 0
         self.in_track_streak = 0
@@ -350,7 +347,7 @@ class TorcsEnv(gym.Env):
         state = self._build_state_vector(raw_obs)
 
         # ------ 5. Compute per-step reward ------
-        reward, reward_info = self._compute_reward(raw_obs, steer, accel, brake)
+        reward, reward_info = self._compute_reward(raw_obs, steer)
 
         # ------ 6. Check termination ------
         terminated, truncated, terminal_reason = self._check_terminal(raw_obs)
@@ -400,7 +397,15 @@ class TorcsEnv(gym.Env):
     def _build_state_vector(self, raw):
         """
         Convert the raw TORCS sensor dictionary into a normalized
-        65-dimensional numpy array.
+        29-dimensional numpy array.
+
+        REDUCED from 65 dims: removed the 36-dim opponents sensor.
+        In single-car training, opponents always reads a constant
+        [200.0]*36 (no other car ever nearby) -- after normalization
+        that's a constant 1.0 across all 36 dims, every single step,
+        for the entire project. It carried zero information and only
+        diluted the genuinely useful signal (track sensors, trackPos)
+        by occupying more than half the input vector.
 
         Layout (indices):
             [0]      angle           -- car heading vs track direction
@@ -411,7 +416,6 @@ class TorcsEnv(gym.Env):
             [5:24]   track[0..18]    -- 19 range-finder distances
             [24:28]  wheelSpinVel[0..3] -- 4 wheel rotation speeds
             [28]     rpm             -- engine revs
-            [29:65]  opponents[0..35]-- 36 opponent distance sensors
         """
         angle = raw.get("angle", 0.0) / NORM["angle"]
         track_pos = np.clip(raw.get("trackPos", 0.0), -2.0, 2.0) / NORM["trackPos"]
@@ -427,18 +431,12 @@ class TorcsEnv(gym.Env):
 
         rpm = raw.get("rpm", 0.0) / NORM["rpm"]
 
-        # Single-car: opponents will all be 200 (no other car nearby).
-        # After /200 they become 1.0, which the network learns to ignore.
-        opp = np.array(raw.get("opponents", [200.0] * 36), dtype=np.float32)
-        opp = opp / NORM["opponents"]
-
         state = np.concatenate([
             [angle, track_pos, speed_x, speed_y, speed_z],  # 5
             track,                                           # 19
             wsv,                                             # 4
             [rpm],                                           # 1
-            opp,                                             # 36
-        ]).astype(np.float32)                                # total = 65
+        ]).astype(np.float32)                                # total = 29
 
         return np.clip(state, -1.0, 1.0)
 
@@ -482,14 +480,38 @@ class TorcsEnv(gym.Env):
     #  Reward: orchestrator
     # ============================================================
 
-    def _compute_reward(self, obs, steer, accel, brake):
+    def _compute_reward(self, obs, steer):
         """
         Compute the composite per-step reward.
 
-        R_total = w_speed * R_speed + w_safety * R_safety
+        R_total = w_core_progress * R_core_progress + w_safety * R_safety
                   + w_smooth * R_smooth + w_anticipation * R_anticipation
-                  + w_progress * R_progress + w_pedal_conflict * R_pedal_conflict
                   + time_penalty
+
+        RESTRUCTURED: previously R_speed (forward/lateral) and the
+        speedX*trackPos cross-term (inside R_safety) were computed
+        separately and combined via two independently-tuned weights
+        (w_speed=0.15, w_safety=1.0) -- this let the squared boundary
+        penalty's speed-INdependent magnitude get decoupled from the
+        speed-scaled terms, and contributed to the previously-measured
+        "speed reward = 126% of total" imbalance (check_reward_composition.py).
+        Direct comparison against a working reference PPO-for-TORCS
+        implementation showed its entire reward is ONE speed-scaled
+        formula: progress = sp*cos(angle) - |sp*sin(angle)| -
+        sp*|trackPos| -- meaning every component automatically goes to
+        zero as speed goes to zero, by construction, with no separate
+        weight to keep in balance. R_core_progress below adopts that
+        exact structure. R_safety now contains ONLY the squared
+        boundary penalty (deliberately speed-INDEPENDENT -- riding the
+        wall should be penalized even at low speed, this is an
+        intentional exception, not an oversight).
+
+        REMOVED: the standalone potential-based progress-shaping term
+        and the accel/brake pedal-conflict penalty (both retired --
+        see git history / project notes for why: the new core formula
+        and the policy-level sigma cap (capped_policy.py) are expected
+        to address what those two reward-side patches were compensating
+        for, from a different layer).
 
         The time_penalty is a flat, unweighted constant applied every step
         (see config.py REWARD_PARAMS["time_penalty"] for why).
@@ -500,158 +522,106 @@ class TorcsEnv(gym.Env):
         """
         w = config.REWARD_WEIGHTS
 
-        r_speed          = self._compute_speed_reward(obs)
+        r_core_progress  = self._compute_core_progress_reward(obs)
         r_safety         = self._compute_safety_reward(obs)
         r_smooth         = self._compute_smoothness_reward(steer)
         r_anticipation   = self._compute_anticipation_reward(obs)
-        r_progress       = self._compute_progress_reward(obs)
-        r_pedal_conflict = self._compute_pedal_conflict_reward(accel, brake)
         r_time           = config.REWARD_PARAMS["time_penalty"]
 
         total = (
-            w["w_speed"]  * r_speed
+            w["w_core_progress"] * r_core_progress
             + w["w_safety"] * r_safety
             + w["w_smooth"] * r_smooth
             + w["w_anticipation"] * r_anticipation
-            + w["w_progress"] * r_progress
-            + w["w_pedal_conflict"] * r_pedal_conflict
             + r_time
         )
 
         info = {
-            "r_speed":  r_speed,
-            "r_pedal_conflict": r_pedal_conflict,
+            "r_core_progress": r_core_progress,
             "r_safety": r_safety,
             "r_smooth": r_smooth,
             "r_anticipation": r_anticipation,
-            "r_progress": r_progress,
             "r_time":   r_time,
         }
         return total, info
 
     # ============================================================
-    #  Reward: potential-based "progress" component (NEW)
+    #  Reward: core progress component (speed-scaled, REPLACES old
+    #  R_speed + the speedX*trackPos cross-term formerly in R_safety)
     # ============================================================
 
-    def _compute_progress_reward(self, obs):
+    def _compute_core_progress_reward(self, obs):
         """
-        R_progress = gamma * Phi(s') - Phi(s)
-        where Phi(s) = distRaced - lateral_k*|trackPos| - angle_k*|angle|
+        R_core_progress = speedX*cos(angle)
+                           - speedX*|sin(angle)| * lateral_penalty_k
+                           - speedX*|trackPos|   * core_progress_beta
 
-        ADDED to directly address a confirmed observed problem (visually
-        verified by the user, not just inferred): the car DOES decelerate
-        approaching the known hairpin hotspots (400-500m, 1200-1400m),
-        but still fails -- meaning the car is willing to attempt
-        corrections, but the existing reward structure actively punishes
-        deceleration via R_speed dropping, which may be discouraging it
-        from braking earlier/harder than it currently does.
+        Directly modeled on a working reference PPO-for-TORCS
+        implementation's entire reward function. All three terms share
+        speedX as a multiplicative factor, so the WHOLE thing collapses
+        toward zero as the car slows toward a stop -- this is the
+        single biggest structural difference from this project's
+        previous reward design, where a speed-independent squared
+        boundary penalty (still present, see _compute_safety_reward)
+        and other speed-independent terms could keep firing even when
+        the car wasn't moving, diluting the "low speed = low reward
+        either way" property the reference design has by construction.
 
-        This term credits genuine moment-to-moment improvement in
-        overall driving state (more distance covered, closer to center,
-        better-aligned heading) rather than raw speed alone -- so
-        slowing down to correct trackPos/angle can still register as
-        "progress" even while R_speed drops, instead of being a pure
-        loss with no offsetting signal.
-
-        HONEST LIMITATION: if the true bottleneck at these hotspots is
-        insufficient reaction distance/sensor warning (a geometry-level
-        constraint), this term cannot manufacture more reaction space --
-        it can only make the agent MORE WILLING to use the space it
-        already has more decisively. Re-verify with
-        check_approach_behavior.py after training with this enabled to
-        see whether deceleration becomes earlier/stronger, and whether
-        that's enough.
-
-        Uses the same potential-based shaping form (Ng, Harada &
-        Russell, 1999) as the existing recovery-reward design elsewhere
-        in this project: telescopes to ~zero over any round trip, so
-        there's no way to farm this by oscillating state back and
-        forth -- only genuine net improvement over a stretch pays out.
+        Term 1 (forward): rewards progress along the track direction;
+            full credit when heading matches track direction
+            (cos(angle)~=1), reduced when sideways.
+        Term 2 (lateral): penalizes heading-angle mismatch scaled by
+            speed -- "snaking"/weaving while moving fast is penalized
+            more than while moving slow.
+        Term 3 (trackPos cross-term): penalizes positional deviation
+            from center scaled by speed -- drifting off-center fast is
+            penalized more than drifting slowly. This is the term that
+            used to live inside _compute_safety_reward as
+            "safety_speed_beta"; moved here so it shares the same
+            speed-scaling property as the other two terms instead of
+            being bundled with the speed-INDEPENDENT boundary penalty.
         """
-        p = config.REWARD_PARAMS
-        dist_raced = obs.get("distRaced", 0.0)
+        speed_x   = obs.get("speedX", 0.0)
+        angle     = obs.get("angle", 0.0)
         track_pos = obs.get("trackPos", 0.0)
-        angle = obs.get("angle", 0.0)
+        p = config.REWARD_PARAMS
 
-        potential_now = (
-            dist_raced
-            - p["progress_lateral_k"] * abs(track_pos)
-            - p["progress_angle_k"] * abs(angle)
-        )
+        forward = speed_x * math.cos(angle)
+        lateral = speed_x * abs(math.sin(angle)) * p["lateral_penalty_k"]
+        position_cross = speed_x * abs(track_pos) * p["core_progress_beta"]
 
-        if self.prev_progress_potential is None:
-            self.prev_progress_potential = potential_now
-            return 0.0
-
-        gamma = config.PPO_PARAMS["gamma"]
-        shaping = gamma * potential_now - self.prev_progress_potential
-        self.prev_progress_potential = potential_now
-        return shaping
-
-
-    #  Reward: speed component
-    # ============================================================
-
-    def _compute_speed_reward(self, obs):
-        """
-        R_speed = speedX * cos(angle) - speedX * |sin(angle)| * k
-
-        First term:  reward forward progress along the track direction.
-                     If the car is heading straight, cos(angle) ≈ 1, full credit.
-                     If sideways, cos → 0, reduced credit.
-        Second term: penalize lateral "snaking" (weaving left-right).
-                     Prevents the agent from gaming the reward by oscillating.
-        """
-        speed_x = obs.get("speedX", 0.0)
-        angle   = obs.get("angle", 0.0)
-        k       = config.REWARD_PARAMS["lateral_penalty_k"]
-
-        forward  = speed_x * math.cos(angle)
-        lateral  = speed_x * abs(math.sin(angle)) * k
-
-        return forward - lateral
+        return forward - lateral - position_cross
 
     # ============================================================
-    #  Reward: safety component
+    #  Reward: safety component (speed-INDEPENDENT boundary penalty only)
     # ============================================================
 
     def _compute_safety_reward(self, obs):
         """
-        Single-car stage:
-            R_safety = -max(0, |trackPos| - safety_margin)^2
-                       - beta * speedX * |trackPos|
+        R_safety = -max(0, |trackPos| - safety_margin)^2
 
-            The first term (squared margin penalty, unchanged) fires
-            only once the car is meaningfully off-center, and grows
-            fast as it gets closer to the edge.
+        Deliberately speed-INDEPENDENT: riding the wall should be
+        penalized even at low/zero speed (e.g. while stopped pinned
+        against a barrier), so this term is kept separate from the new
+        speed-scaled core progress term rather than folded into it.
+        Fires only once the car is meaningfully off-center, and grows
+        fast (squared) as it gets closer to the edge.
 
-            The second term (speed x deviation, new) is always active,
-            scaling the deviation penalty by current speed -- drifting
-            off-center at high speed is penalized more than drifting at
-            low speed, even before crossing the safety_margin threshold.
-            Added based on a TORCS-RL literature pattern (see config.py
-            REWARD_PARAMS comment for the citation and caveats); this
-            complements the angle-based lateral term already in
-            _compute_speed_reward (heading mismatch) and the
-            forward-clearance-based anticipation term (distance ahead)
-            -- three different signals, not redundant with each other.
+        The speed-scaled trackPos deviation term that used to live
+        here (safety_speed_beta) has moved into
+        _compute_core_progress_reward, since it shares that function's
+        "scales toward zero at low speed" property and doesn't belong
+        with this speed-independent boundary term.
 
         Multi-car stage (future):
             Will be extended to incorporate opponent proximity penalty.
         """
         track_pos = abs(obs.get("trackPos", 0.0))
-        speed_x   = obs.get("speedX", 0.0)
         margin    = config.REWARD_PARAMS["safety_margin"]
-        beta      = config.REWARD_PARAMS["safety_speed_beta"]
 
         if track_pos > margin:
-            boundary_penalty = -((track_pos - margin) ** 2)
-        else:
-            boundary_penalty = 0.0
-
-        speed_deviation_penalty = -beta * speed_x * track_pos
-
-        return boundary_penalty + speed_deviation_penalty
+            return -((track_pos - margin) ** 2)
+        return 0.0
 
     # ============================================================
     def _compute_smoothness_reward(self, steer):
@@ -672,34 +642,6 @@ class TorcsEnv(gym.Env):
         self.prev_steer = steer
         k = config.REWARD_PARAMS["smoothness_k"]
         return -k * delta
-
-    def _compute_pedal_conflict_reward(self, accel, brake):
-        """
-        Penalizes pressing accel and brake at the same time, scaled by
-        how much they overlap.
-
-        ADDED after direct log evidence: in early-training episodes
-        where the car barely moved (e.g. 2.96m over 800 steps), accel
-        was frequently high (often >0.9) at the SAME step brake was also
-        high (sometimes also >0.9) -- the two were fighting each other,
-        wasting the car's forward effort rather than the car "not
-        wanting" to move. This is a distinct problem from a weak speed
-        incentive (raising w_speed doesn't fix two opposing forces
-        canceling out; it would just make the car push harder into both
-        pedals at once).
-
-        Uses min(accel, brake) once both exceed the threshold, rather
-        than a flat penalty for crossing it -- this scales the penalty
-        to the actual size of the wasted overlap (accel=1.0,brake=1.0 is
-        penalized far more than accel=0.9,brake=0.31, which barely
-        crosses the threshold).
-        """
-        p = config.REWARD_PARAMS
-        threshold = p["pedal_conflict_threshold"]
-        if accel > threshold and brake > threshold:
-            overlap = min(accel, brake)
-            return -p["pedal_conflict_k"] * overlap
-        return 0.0
 
     def _compute_anticipation_reward(self, obs):
         """
@@ -1023,7 +965,7 @@ class TorcsEnv(gym.Env):
             # Actions taken by the agent
             "steer", "accel", "brake", "gear",
             # Reward breakdown (for ablation comparison)
-            "r_speed", "r_safety", "r_smooth", "r_anticipation", "r_progress", "r_pedal_conflict", "r_time", "r_terminal", "r_checkpoint", "r_record", "reward_total",
+            "r_core_progress", "r_safety", "r_smooth", "r_anticipation", "r_time", "r_terminal", "r_checkpoint", "r_record", "reward_total",
             # Episode event
             "terminal_reason",
         ])
@@ -1046,12 +988,10 @@ class TorcsEnv(gym.Env):
             float(action[1]),
             float(action[2]),
             self.client.R.d.get("gear", 0),
-            reward_info.get("r_speed", 0),
+            reward_info.get("r_core_progress", 0),
             reward_info.get("r_safety", 0),
             reward_info.get("r_smooth", 0),
             reward_info.get("r_anticipation", 0),
-            reward_info.get("r_progress", 0),
-            reward_info.get("r_pedal_conflict", 0),
             reward_info.get("r_time", 0),
             reward_info.get("terminal", 0),
             reward_info.get("checkpoint", 0),
@@ -1185,7 +1125,7 @@ class TorcsEnv(gym.Env):
         # log file just stopped with no terminal_reason at all).
         if self._log_writer is not None:
             self._log_writer.writerow(
-                [self.time_step] + [""] * 22 + ["training_stopped"]
+                [self.time_step] + [""] * 20 + ["training_stopped"]
             )
         self._close_episode_log()
         self._disconnect()

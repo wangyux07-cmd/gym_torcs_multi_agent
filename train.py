@@ -36,6 +36,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 import config
 from gym_torcs_env import TorcsEnv
+from capped_policy import CappedActorCriticPolicy
 
 
 def make_env():
@@ -129,7 +130,7 @@ def main():
         if checkpoint_path is None:
             print("No checkpoint found -- starting a fresh training run instead.")
             model = PPO(
-                "MlpPolicy",
+                CappedActorCriticPolicy,
                 env,
                 tensorboard_log=config.TRAINING["tensorboard_log_dir"],
                 **config.PPO_PARAMS,
@@ -162,6 +163,15 @@ def main():
                 # smooth decay would require a custom callback that
                 # mutates model.ent_coef partway through training.
 
+            # target_kl is a NEW addition not present when the
+            # 840000-step checkpoint was originally saved -- without
+            # this explicit override, the loaded model's target_kl
+            # would be whatever was saved (None, meaning "no cap" at
+            # all, the exact opposite of what we want).
+            old_target_kl = model.target_kl
+            model.target_kl = config.PPO_PARAMS["target_kl"]
+            print(f"Overrode target_kl: {old_target_kl} -> {model.target_kl}")
+
             if "lr_decay_to" in config.RESUME_OVERRIDES:
                 from stable_baselines3.common.utils import get_linear_fn
                 start_lr = config.RESUME_OVERRIDES.get("lr_decay_start", model.learning_rate)
@@ -185,8 +195,13 @@ def main():
             model = PPO.load(bc_path, env=env)
         else:
             print("Starting a fresh training run.")
+            # NOTE: any checkpoint saved before this project's
+            # state-vector/reward/policy restructuring (65-dim obs,
+            # default MlpPolicy) is NOT compatible with this model --
+            # --resume/--warmstart against an old checkpoint will fail
+            # with a tensor-shape mismatch, not load silently-wrong.
             model = PPO(
-                "MlpPolicy",
+                CappedActorCriticPolicy,
                 env,
                 tensorboard_log=config.TRAINING["tensorboard_log_dir"],
                 **config.PPO_PARAMS,

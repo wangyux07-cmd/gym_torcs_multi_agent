@@ -13,21 +13,29 @@ Usage example (in experiment scripts):
 
 # ===================== Reward Weights =====================
 REWARD_WEIGHTS = {
-    # LOWERED further from 0.4 to 0.15, backed by REAL measured data
-    # (check_reward_composition.py on 20 real episodes): speed reward
-    # was 126% of total reconstructed reward -- meaning without it, the
-    # total would be NEGATIVE (all other components combined were net
-    # negative). Speed was single-handedly propping up the entire
-    # reward signal, while checkpoint+record combined were under 1%.
-    # This isn't a guess anymore, it's measured: speed needs to come
-    # down sharply for the milestone/record rewards (raised below) to
-    # have any real chance of competing.
-    "w_speed":   0.3,
-    "w_safety":  1.0,   # Weight for track-edge / opponent proximity penalty
+    # RESTRUCTURED: previously w_speed(0.15) scaled a standalone
+    # R_speed term, and a separate safety_speed_beta(0.005) lived
+    # inside w_safety's R_safety. Both have merged into ONE term,
+    # _compute_core_progress_reward (forward + lateral + trackPos
+    # cross-term, all speed-scaled together -- mirroring a working
+    # reference PPO-for-TORCS implementation's single unified reward).
+    # Kept at 0.15 (matching the old w_speed) rather than 1.0: the
+    # forward/lateral terms inside the new core formula are
+    # mathematically IDENTICAL to the old R_speed formula, so this
+    # preserves the same per-step magnitude scale that checkpoint/
+    # lap_complete_bonus/record_reward_k were already measured and
+    # calibrated against (check_reward_composition.py) -- avoids
+    # needing to re-derive every other reward magnitude from scratch
+    # in the same pass as this restructuring.
+    "w_core_progress": 0.15,
+    # Now governs ONLY the speed-independent squared boundary penalty
+    # (the speedX*trackPos cross-term that used to share this weight
+    # has moved into w_core_progress above). Left at 1.0, unchanged --
+    # the boundary penalty's own formula/scale didn't change, only
+    # what it's no longer bundled with.
+    "w_safety":  1.0,
     "w_smooth":  0.3,   # Weight for steering-smoothness penalty
     "w_anticipation": 0.25,
-    "w_progress": 1.0,  # Weight for the potential-based progress-shaping term (see _compute_progress_reward)
-    "w_pedal_conflict": 1.0,  # Weight for the accel/brake-overlap penalty (see _compute_pedal_conflict_reward)
 }
 
 # ===================== Reward Detail Parameters =====================
@@ -42,44 +50,25 @@ REWARD_PARAMS = {
     # edge, instead of growing at a constant rate. A car wall-riding at
     # trackPos=0.95 now gets penalized far more harshly than one merely
     # touching the margin at trackPos=0.65.
-    "lateral_penalty_k": 0.5,   # Coefficient penalizing lateral snaking in R_speed
+    "lateral_penalty_k": 0.5,   # Coefficient penalizing lateral snaking in R_core_progress
     # Speed x trackPos deviation term, added after reviewing TORCS-RL
-    # literature (Wang, Jia & Weng 2018, arXiv:1811.11329 -- TORCS+DDPG,
-    # designs own reward to "stick to center of road"; similar
-    # speed-scaled deviation terms also appear in other racing-RL
-    # papers). The existing squared safety penalty above only depends
-    # on position (same penalty whether drifting at 20 km/h or 150
-    # km/h at the same trackPos); this term scales the deviation
-    # penalty by current speed, so high-speed drifting is penalized
-    # more than slow drifting -- complementary to (not redundant
-    # with) the existing position-only penalty and the angle-based
-    # lateral term already in _compute_speed_reward (that one penalizes
-    # heading-angle mismatch, not positional offset).
+    # literature (Wang, Jia & Weng 2018, arXiv:1811.11329). MOVED from
+    # R_safety into R_core_progress (see _compute_core_progress_reward):
+    # this term shares the "scales toward zero at low speed" property
+    # with the forward/lateral terms it now lives alongside, and no
+    # longer belongs bundled with R_safety's speed-independent squared
+    # boundary penalty.
     # NOTE: exact coefficient from the cited paper not independently
     # verified -- this starting value (0.005) was sized so a typical
     # high-speed deviation (speed=70, trackPos=0.5) produces a modest
-    # penalty (~0.18) that doesn't yet dominate R_speed; treat as a
-    # starting point to observe and adjust, not a literature-exact value.
-    "safety_speed_beta": 0.005,
+    # penalty (~0.18); treat as a starting point to observe and adjust.
+    "core_progress_beta": 0.005,
     # Steering smoothness: penalizes large frame-to-frame changes in the
     # steering action. This directly targets the "jerky driving" and
     # "oversteers into the wall while correcting" behavior observed in
     # training -- right now nothing discourages slamming the wheel from
     # one extreme to the other.
     "smoothness_k": 1.0,
-    # ===== Pedal conflict penalty (see _compute_pedal_conflict_reward) =====
-    # Added after direct log evidence of accel and brake both being
-    # pressed hard at the same step, repeatedly, while the car barely
-    # moved. threshold=0.3 per the original request ("both > 0.3");
-    # k=10 sized so a FULL overlap (accel=1.0,brake=1.0, min=1.0) gives
-    # a clearly noticeable single-step penalty (-10), deliberately
-    # larger than smoothness's max contribution (~0.6 weighted) since
-    # this is currently the most direct, evidence-backed behavioral fix
-    # -- not yet validated against real retraining data, watch
-    # check_reward_composition.py after the next run to see its actual
-    # share of total reward.
-    "pedal_conflict_threshold": 0.3,
-    "pedal_conflict_k": 10.0,
     "time_penalty": -1.0,
     # RAISED (all four terminal penalties below, roughly 6-8x): backed
     # by REAL measured data (check_reward_composition.py) -- across 20
@@ -183,15 +172,6 @@ REWARD_PARAMS = {
         (3000.0, 675.0),
         (3400.0, 750.0),
     ],
-    # ===== Progress-shaping coefficients (see _compute_progress_reward) =====
-    # Potential function: Phi = distRaced - lateral_k*|trackPos| - angle_k*|angle|.
-    # These weights are NOT independently derived/tuned -- they're a
-    # reasonable starting point (position deviation penalized more
-    # heavily than heading-angle deviation, consistent with trackPos
-    # being the more direct out_of_track risk signal) and should be
-    # revisited once you see how this term behaves in practice.
-    "progress_lateral_k": 100.0,
-    "progress_angle_k": 30.0,
     # ===== Record-breaking reward (one-time, persists across episodes) =====
     # Rewards the car for reaching a NEW farthest distance EVER seen in
     # this training run -- not per-episode, a single global high-water
@@ -233,13 +213,16 @@ EPISODE_PARAMS = {
     # almost every step), not an unwillingness to move -- accel was
     # often near max, but chaotic steering meant it never translated
     # into real forward progress (0.1m over 150 steps in one observed
-    # episode). 800 gives random exploration more time to stumble onto
-    # an effective steer+accel combo before being cut off. This does
-    # NOT fix the steering-chaos issue itself (that's a training-time
-    # problem, not a config value) -- it just buys more random-search
-    # time per attempt. Accepted tradeoff: more real wall-clock time
-    # spent on early, likely-still-ineffective episodes.
-    "stuck_time_limit": 800,      # Steps before generic stuck detection activates
+    # episode). Originally raised to 800 to give random exploration
+    # more time to stumble onto an effective steer+accel combo. LOWERED
+    # to 500 here: now that the policy's exploration noise is capped
+    # (see capped_policy.py / config.POLICY_PARAMS), outputs are far
+    # less random per step, so "stumble onto a good combo by brute
+    # chance" matters less than before -- gradient-driven improvement
+    # should do more of the work. 500 still gives a meaningfully longer
+    # window than the original 150 if some random-search benefit
+    # remains.
+    "stuck_time_limit": 500,      # Steps before generic stuck detection activates
     # RAISED from 5000: physical calculation shows this was an
     # impossible ceiling for completing a full lap regardless of
     # driving quality. Corkscrew is 3608.45m; even at a modest 50 km/h
@@ -317,7 +300,11 @@ TORCS_PARAMS = {
 # ===================== State Dimensions =====================
 # angle(1) + trackPos(1) + speedX(1) + speedY(1) + speedZ(1)
 # + track(19) + wheelSpinVel(4) + rpm(1) + opponents(36) = 65
-STATE_DIM = 65
+STATE_DIM = 29  # REDUCED from 65: removed the 36-dim opponents sensor
+# (constant/useless in single-car training -- pure noise diluting the
+# signal). Layout is now angle(1) + trackPos(1) + speedX/Y/Z(3) +
+# track(19) + wheelSpinVel(4) + rpm(1) = 29. See _build_state_vector
+# in gym_torcs_env.py for the exact ordering.
 
 # ===================== Action Dimensions =====================
 # steer [-1,1], accel [0,1], brake [0,1]
@@ -419,6 +406,19 @@ RESUME_OVERRIDES = {
     # Linear decay from the ORIGINAL learning_rate down to this value,
     # spread across the remaining total_timesteps of the resumed run.
     "lr_decay_to": 5e-5,
+}
+
+# ===================== Custom Policy Settings =====================
+# Caps the policy's per-dimension action standard deviation (see
+# capped_policy.py) -- direct comparison against a working reference
+# PPO-for-TORCS implementation found its noise caps were 0.2 (steer),
+# 0.2 (accel), 0.05 (brake), against the SAME action ranges we use
+# ([-1,1], [0,1], [0,1]). This project's measured std was repeatedly
+# 1.6-1.8 -- larger than the entire steering range -- with no upper
+# bound at all (ent_coef only slows growth, never caps it). Order
+# matches the action space: [steer, accel, brake].
+POLICY_PARAMS = {
+    "sigma_caps": [0.2, 0.2, 0.05],
 }
 
 # ===================== Training Run Settings =====================
