@@ -162,7 +162,23 @@ class TorcsEnv(gym.Env):
         self.time_step = 0          # Steps elapsed in current episode
         self.prev_obs_raw = None    # Previous frame's raw sensor dict
         self.prev_steer = None      # Previous step's steer action (for smoothness penalty)
+        self.prev_progress_potential = None  # Previous step's progress potential (for R_progress shaping)
         self.wall_pinned_counter = 0  # Consecutive steps spent jammed against the wall (for termination)
+        self.out_of_track_counter = 0  # Consecutive steps off-track (grace period before termination)
+        self.in_track_streak = 0       # Consecutive steps back IN bounds (must sustain this to clear the counter)
+        # PERSISTENT across episodes (deliberately NOT reset in reset()
+        # -- this is a single running high-water mark for the whole
+        # training run, see _compute_record_reward). KNOWN LIMITATION:
+        # this is in-memory only, not saved/restored with model
+        # checkpoints -- if you stop and --resume training later, this
+        # restarts from 0, meaning the first new max after a resume will
+        # likely trigger a (probably undeserved, since it's not a TRUE
+        # all-time record) payout. Acceptable given time constraints,
+        # but worth knowing if you see an unexplained reward spike right
+        # after a --resume.
+        self.furthest_distance_ever = 0.0
+        self.checkpoints_reached = set()  # Which distance checkpoints (config.REWARD_PARAMS["checkpoints"]) have already paid out this episode
+        self.low_speed_counter = 0  # Consecutive steps below stuck_speed_threshold (resets the moment speed recovers)
         self.pinned_duration = 0      # Separate counter used to trigger reverse-gear assist
         self.prev_dist_from_start = None  # For lap-completion detection
         self.is_initial_reset = True      # True until first reset() finishes
@@ -227,7 +243,12 @@ class TorcsEnv(gym.Env):
         self.prev_obs_raw = dict(raw_obs)
         self.prev_dist_from_start = raw_obs.get("distFromStart", 0)
         self.prev_steer = None
+        self.prev_progress_potential = None
         self.wall_pinned_counter = 0
+        self.out_of_track_counter = 0
+        self.in_track_streak = 0
+        self.checkpoints_reached = set()
+        self.low_speed_counter = 0
         self.pinned_duration = 0
         self.is_initial_reset = False
 
@@ -329,7 +350,7 @@ class TorcsEnv(gym.Env):
         state = self._build_state_vector(raw_obs)
 
         # ------ 5. Compute per-step reward ------
-        reward, reward_info = self._compute_reward(raw_obs, steer)
+        reward, reward_info = self._compute_reward(raw_obs, steer, accel, brake)
 
         # ------ 6. Check termination ------
         terminated, truncated, terminal_reason = self._check_terminal(raw_obs)
@@ -338,6 +359,16 @@ class TorcsEnv(gym.Env):
         terminal_reward = self._get_terminal_reward(terminal_reason)
         reward += terminal_reward
         reward_info["terminal"] = terminal_reward
+
+        # ------ 7b. Add one-time checkpoint reward (sub-goal, see config) ------
+        checkpoint_reward = self._compute_checkpoint_reward(raw_obs, terminal_reason)
+        reward += checkpoint_reward
+        reward_info["checkpoint"] = checkpoint_reward
+
+        # ------ 7c. Add one-time record-breaking reward (new global max distance) ------
+        record_reward = self._compute_record_reward(raw_obs, terminal_reason)
+        reward += record_reward
+        reward_info["record"] = record_reward
 
         # ------ 8. Log this step ------
         self._log_step(raw_obs, action, reward, reward_info, terminal_reason)
@@ -451,12 +482,13 @@ class TorcsEnv(gym.Env):
     #  Reward: orchestrator
     # ============================================================
 
-    def _compute_reward(self, obs, steer):
+    def _compute_reward(self, obs, steer, accel, brake):
         """
         Compute the composite per-step reward.
 
         R_total = w_speed * R_speed + w_safety * R_safety
                   + w_smooth * R_smooth + w_anticipation * R_anticipation
+                  + w_progress * R_progress + w_pedal_conflict * R_pedal_conflict
                   + time_penalty
 
         The time_penalty is a flat, unweighted constant applied every step
@@ -468,30 +500,95 @@ class TorcsEnv(gym.Env):
         """
         w = config.REWARD_WEIGHTS
 
-        r_speed        = self._compute_speed_reward(obs)
-        r_safety       = self._compute_safety_reward(obs)
-        r_smooth       = self._compute_smoothness_reward(steer)
-        r_anticipation = self._compute_anticipation_reward(obs)
-        r_time         = config.REWARD_PARAMS["time_penalty"]
+        r_speed          = self._compute_speed_reward(obs)
+        r_safety         = self._compute_safety_reward(obs)
+        r_smooth         = self._compute_smoothness_reward(steer)
+        r_anticipation   = self._compute_anticipation_reward(obs)
+        r_progress       = self._compute_progress_reward(obs)
+        r_pedal_conflict = self._compute_pedal_conflict_reward(accel, brake)
+        r_time           = config.REWARD_PARAMS["time_penalty"]
 
         total = (
             w["w_speed"]  * r_speed
             + w["w_safety"] * r_safety
             + w["w_smooth"] * r_smooth
             + w["w_anticipation"] * r_anticipation
+            + w["w_progress"] * r_progress
+            + w["w_pedal_conflict"] * r_pedal_conflict
             + r_time
         )
 
         info = {
             "r_speed":  r_speed,
+            "r_pedal_conflict": r_pedal_conflict,
             "r_safety": r_safety,
             "r_smooth": r_smooth,
             "r_anticipation": r_anticipation,
+            "r_progress": r_progress,
             "r_time":   r_time,
         }
         return total, info
 
     # ============================================================
+    #  Reward: potential-based "progress" component (NEW)
+    # ============================================================
+
+    def _compute_progress_reward(self, obs):
+        """
+        R_progress = gamma * Phi(s') - Phi(s)
+        where Phi(s) = distRaced - lateral_k*|trackPos| - angle_k*|angle|
+
+        ADDED to directly address a confirmed observed problem (visually
+        verified by the user, not just inferred): the car DOES decelerate
+        approaching the known hairpin hotspots (400-500m, 1200-1400m),
+        but still fails -- meaning the car is willing to attempt
+        corrections, but the existing reward structure actively punishes
+        deceleration via R_speed dropping, which may be discouraging it
+        from braking earlier/harder than it currently does.
+
+        This term credits genuine moment-to-moment improvement in
+        overall driving state (more distance covered, closer to center,
+        better-aligned heading) rather than raw speed alone -- so
+        slowing down to correct trackPos/angle can still register as
+        "progress" even while R_speed drops, instead of being a pure
+        loss with no offsetting signal.
+
+        HONEST LIMITATION: if the true bottleneck at these hotspots is
+        insufficient reaction distance/sensor warning (a geometry-level
+        constraint), this term cannot manufacture more reaction space --
+        it can only make the agent MORE WILLING to use the space it
+        already has more decisively. Re-verify with
+        check_approach_behavior.py after training with this enabled to
+        see whether deceleration becomes earlier/stronger, and whether
+        that's enough.
+
+        Uses the same potential-based shaping form (Ng, Harada &
+        Russell, 1999) as the existing recovery-reward design elsewhere
+        in this project: telescopes to ~zero over any round trip, so
+        there's no way to farm this by oscillating state back and
+        forth -- only genuine net improvement over a stretch pays out.
+        """
+        p = config.REWARD_PARAMS
+        dist_raced = obs.get("distRaced", 0.0)
+        track_pos = obs.get("trackPos", 0.0)
+        angle = obs.get("angle", 0.0)
+
+        potential_now = (
+            dist_raced
+            - p["progress_lateral_k"] * abs(track_pos)
+            - p["progress_angle_k"] * abs(angle)
+        )
+
+        if self.prev_progress_potential is None:
+            self.prev_progress_potential = potential_now
+            return 0.0
+
+        gamma = config.PPO_PARAMS["gamma"]
+        shaping = gamma * potential_now - self.prev_progress_potential
+        self.prev_progress_potential = potential_now
+        return shaping
+
+
     #  Reward: speed component
     # ============================================================
 
@@ -576,6 +673,34 @@ class TorcsEnv(gym.Env):
         k = config.REWARD_PARAMS["smoothness_k"]
         return -k * delta
 
+    def _compute_pedal_conflict_reward(self, accel, brake):
+        """
+        Penalizes pressing accel and brake at the same time, scaled by
+        how much they overlap.
+
+        ADDED after direct log evidence: in early-training episodes
+        where the car barely moved (e.g. 2.96m over 800 steps), accel
+        was frequently high (often >0.9) at the SAME step brake was also
+        high (sometimes also >0.9) -- the two were fighting each other,
+        wasting the car's forward effort rather than the car "not
+        wanting" to move. This is a distinct problem from a weak speed
+        incentive (raising w_speed doesn't fix two opposing forces
+        canceling out; it would just make the car push harder into both
+        pedals at once).
+
+        Uses min(accel, brake) once both exceed the threshold, rather
+        than a flat penalty for crossing it -- this scales the penalty
+        to the actual size of the wasted overlap (accel=1.0,brake=1.0 is
+        penalized far more than accel=0.9,brake=0.31, which barely
+        crosses the threshold).
+        """
+        p = config.REWARD_PARAMS
+        threshold = p["pedal_conflict_threshold"]
+        if accel > threshold and brake > threshold:
+            overlap = min(accel, brake)
+            return -p["pedal_conflict_k"] * overlap
+        return 0.0
+
     def _compute_anticipation_reward(self, obs):
         """
         Penalizes maintaining high speed when the front-facing distance
@@ -648,6 +773,89 @@ class TorcsEnv(gym.Env):
         # "max_steps" (truncated) or empty reason: no extra reward
         return 0.0
 
+    def _compute_checkpoint_reward(self, obs, terminal_reason):
+        """
+        One-time bonus the first time distRaced crosses each configured
+        checkpoint distance within an episode (config.REWARD_PARAMS
+        ["checkpoints"]). Added because the per-step reward terms are
+        all "direction"-shaped (reward fast/centered driving moment to
+        moment) but nothing directly credits actually covering ground
+        on this specific track -- giving the agent achievable
+        intermediate sub-goals on the way to a full lap, scaled to fit
+        this project's existing terminal-reward convention (tens, with
+        lap_complete_bonus=150 as the ceiling -- NOT the much larger
+        "thousands" scale used in a separate, unrelated experiment
+        branch of this project).
+
+        Checkpoints are placed at 25/50/75% of the known Corkscrew lap
+        length (3608.45m -> ~900/1800/2700m), so the first one already
+        requires getting through the early part of the track -- including
+        whatever corner is currently causing the car to stop short.
+
+        Guards against the same "farm it by oscillating across the
+        line" exploit class as the out_of_track grace-period logic: a
+        checkpoint only pays out ONCE per episode (self.checkpoints_reached),
+        and not at all if THIS step is simultaneously a collision/
+        out_of_track termination (i.e. the car didn't actually clear it
+        safely, it just happened to cross the distance threshold at the
+        moment it crashed/left the track).
+        """
+        dist_raced = obs.get("distRaced", 0.0)
+        total_bonus = 0.0
+
+        if terminal_reason in ("collision", "out_of_track"):
+            return 0.0
+
+        for checkpoint_distance, bonus in config.REWARD_PARAMS["checkpoints"]:
+            if checkpoint_distance in self.checkpoints_reached:
+                continue
+            if dist_raced >= checkpoint_distance:
+                self.checkpoints_reached.add(checkpoint_distance)
+                total_bonus += bonus
+
+        return total_bonus
+
+    def _compute_record_reward(self, obs, terminal_reason):
+        """
+        One-time bonus when distRaced reaches a NEW all-time high for
+        this training run (not per-episode -- a single global
+        high-water mark, see self.furthest_distance_ever, deliberately
+        persistent across episodes).
+
+        Directly serves the priority shift to "just finish a lap,
+        speed doesn't matter": this rewards genuinely exploring further
+        than the policy has EVER gotten before, regardless of how slow
+        or fast it got there.
+
+        Safe by construction against the oscillation-farming exploit
+        found elsewhere in this project: the high-water mark only ever
+        increases (line below), so the same ground can never pay out
+        twice -- there's no way to "flicker" past a point repeatedly to
+        re-trigger this.
+
+        Requires beating the old record by at least
+        record_min_improvement meters (not just any improvement,
+        however tiny) -- without this, ordinary random fluctuation of a
+        few centimeters past the previous max would constantly trigger
+        trivial, noisy payouts that don't represent real progress.
+
+        Does not pay out if this same step is a collision/out_of_track
+        termination (consistent with the checkpoint reward's logic --
+        crossing the line at the exact moment of crashing doesn't count
+        as a genuine, safe breakthrough).
+        """
+        if terminal_reason in ("collision", "out_of_track"):
+            return 0.0
+
+        p = config.REWARD_PARAMS
+        dist_raced = obs.get("distRaced", 0.0)
+
+        if dist_raced < self.furthest_distance_ever + p["record_min_improvement"]:
+            return 0.0
+
+        self.furthest_distance_ever = dist_raced
+        return p["record_reward_k"] * (dist_raced ** 0.5)
+
     # ============================================================
     #  Termination logic
     # ============================================================
@@ -674,9 +882,38 @@ class TorcsEnv(gym.Env):
         if obs.get("damage", 0.0) - prev_damage > 0:
             return True, False, "collision"
 
-        # --- Out of track ---
+        # --- Out of track (soft, grace-period -- no longer instant) ---
+        # Previously terminated the instant |trackPos| > 1.0. Softened
+        # because instant termination only teaches the agent to AVOID
+        # ever crossing the line, never to RECOVER once it has -- and
+        # combined with the other per-step penalties largely vanishing
+        # at low speed (see anticipation/smoothness below), this was
+        # part of what made "just stop before the corner" look like a
+        # safer bet than attempting it. The car now gets
+        # out_of_track_grace_steps consecutive steps to steer back onto
+        # the track before the episode actually ends. The continuous
+        # squared R_safety penalty still grows the further past 1.0 the
+        # car drifts, so there's no incentive to linger off-track on
+        # purpose -- this only removes the IMMEDIATE reset.
+        #
+        # Anti-flicker fix included from the start (not bolted on after
+        # the fact): the off-track counter is NOT cleared by a single
+        # in-bounds frame. The car must stay continuously within bounds
+        # for out_of_track_recovery_streak_required steps before the
+        # counter resets -- otherwise an agent could learn to "flicker"
+        # back and forth across the boundary, never accumulating enough
+        # consecutive off-track steps to trigger termination while still
+        # effectively riding/cutting along the edge indefinitely.
+        ep = config.EPISODE_PARAMS
         if abs(obs.get("trackPos", 0.0)) > 1.0:
-            return True, False, "out_of_track"
+            self.out_of_track_counter += 1
+            self.in_track_streak = 0
+            if self.out_of_track_counter > ep["out_of_track_grace_steps"]:
+                return True, False, "out_of_track"
+        else:
+            self.in_track_streak += 1
+            if self.in_track_streak >= ep["out_of_track_recovery_streak_required"]:
+                self.out_of_track_counter = 0
 
         # --- Running backward ---
         if math.cos(obs.get("angle", 0.0)) < 0:
@@ -698,10 +935,28 @@ class TorcsEnv(gym.Env):
         else:
             self.wall_pinned_counter = 0
 
-        # --- Stuck (too slow for too long) ---
-        if self.time_step > ep["stuck_time_limit"]:
-            if obs.get("speedX", 0.0) < ep["stuck_speed_threshold"]:
+        # --- Stuck (too slow for too long, CONSECUTIVELY) ---
+        # FIXED: the previous version checked "has total time_step
+        # passed stuck_time_limit AND is speed low RIGHT NOW", which has
+        # two opposite problems: (1) the pre-race countdown (car
+        # naturally stationary for the first ~50 steps of every episode)
+        # eats into that same budget, so a car that's merely slow to get
+        # going could get unfairly cut off right as it's starting; (2) a
+        # car briefly slowing to navigate a tight corner at any point
+        # after the threshold would get wrongly flagged as "stuck" even
+        # though it's driving normally, since the check only looks at
+        # one instant, not whether it's ACTUALLY been stuck for a
+        # sustained stretch. Now tracks a consecutive low-speed counter
+        # that resets to 0 the moment speed recovers above the
+        # threshold -- so the countdown doesn't count against the
+        # budget as long as the car accelerates normally afterward, and
+        # a momentary slow corner doesn't wrongly trigger this either.
+        if obs.get("speedX", 0.0) < ep["stuck_speed_threshold"]:
+            self.low_speed_counter += 1
+            if self.low_speed_counter > ep["stuck_time_limit"]:
                 return True, False, "stuck"
+        else:
+            self.low_speed_counter = 0
 
         # --- Lap completed ---
         # Detection: distFromStart jumps from a large value back near 0
@@ -768,7 +1023,7 @@ class TorcsEnv(gym.Env):
             # Actions taken by the agent
             "steer", "accel", "brake", "gear",
             # Reward breakdown (for ablation comparison)
-            "r_speed", "r_safety", "r_smooth", "r_anticipation", "r_time", "r_terminal", "reward_total",
+            "r_speed", "r_safety", "r_smooth", "r_anticipation", "r_progress", "r_pedal_conflict", "r_time", "r_terminal", "r_checkpoint", "r_record", "reward_total",
             # Episode event
             "terminal_reason",
         ])
@@ -795,8 +1050,12 @@ class TorcsEnv(gym.Env):
             reward_info.get("r_safety", 0),
             reward_info.get("r_smooth", 0),
             reward_info.get("r_anticipation", 0),
+            reward_info.get("r_progress", 0),
+            reward_info.get("r_pedal_conflict", 0),
             reward_info.get("r_time", 0),
             reward_info.get("terminal", 0),
+            reward_info.get("checkpoint", 0),
+            reward_info.get("record", 0),
             reward,
             terminal_reason,
         ])
@@ -926,7 +1185,7 @@ class TorcsEnv(gym.Env):
         # log file just stopped with no terminal_reason at all).
         if self._log_writer is not None:
             self._log_writer.writerow(
-                [self.time_step] + [""] * 18 + ["training_stopped"]
+                [self.time_step] + [""] * 22 + ["training_stopped"]
             )
         self._close_episode_log()
         self._disconnect()

@@ -86,7 +86,19 @@ def main():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume training from the latest checkpoint instead of starting fresh.",
+        help="Resume training from a checkpoint instead of starting fresh. "
+             "By default uses the most recently MODIFIED checkpoint file -- "
+             "use --checkpoint to pick a SPECIFIC one instead (important if "
+             "the latest-by-time checkpoint is not the one you actually want, "
+             "e.g. after a training collapse where the final checkpoint is "
+             "worse than an earlier one).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to a SPECIFIC checkpoint .zip to resume from (overrides "
+             "the 'latest by modification time' default). Example: "
+             "--checkpoint ./checkpoints/torcs_ppo_840000_steps.zip",
     )
     parser.add_argument(
         "--warmstart",
@@ -113,8 +125,8 @@ def main():
 
     # --- Create or load the PPO model ---
     if args.resume:
-        latest = find_latest_checkpoint(config.TRAINING["checkpoint_dir"])
-        if latest is None:
+        checkpoint_path = args.checkpoint or find_latest_checkpoint(config.TRAINING["checkpoint_dir"])
+        if checkpoint_path is None:
             print("No checkpoint found -- starting a fresh training run instead.")
             model = PPO(
                 "MlpPolicy",
@@ -123,14 +135,48 @@ def main():
                 **config.PPO_PARAMS,
             )
         else:
-            print(f"Resuming from checkpoint: {latest}")
-            model = PPO.load(latest, env=env)
+            print(f"Resuming from checkpoint: {checkpoint_path}")
+            model = PPO.load(checkpoint_path, env=env)
             # Restore VecNormalize running statistics if they were saved.
             stats_path = config.NORMALIZE["stats_path"]
             if config.NORMALIZE["enabled"] and os.path.exists(stats_path):
                 env = VecNormalize.load(stats_path, env.venv)
                 model.set_env(env)
                 print(f"Restored normalization statistics from {stats_path}")
+
+            # IMPORTANT: PPO.load() restores the hyperparameters EXACTLY
+            # as they were at save time -- it does NOT pick up whatever
+            # is currently in config.PPO_PARAMS. Any change you've made
+            # to config.py since this checkpoint was saved (e.g. a lower
+            # ent_coef, or adding learning-rate decay) has NO EFFECT
+            # unless explicitly applied here, after loading.
+            if "ent_coef" in config.RESUME_OVERRIDES:
+                old_ent_coef = model.ent_coef
+                model.ent_coef = config.RESUME_OVERRIDES["ent_coef"]
+                print(f"Overrode ent_coef: {old_ent_coef} -> {model.ent_coef}")
+                # NOTE: SB3 documents ent_coef as a plain float, with no
+                # built-in schedule/decay support (unlike learning_rate
+                # below, which DOES support a callable schedule natively).
+                # This sets a new FIXED value for the rest of training --
+                # it is a one-time step-down, not a smooth decay. A true
+                # smooth decay would require a custom callback that
+                # mutates model.ent_coef partway through training.
+
+            if "lr_decay_to" in config.RESUME_OVERRIDES:
+                from stable_baselines3.common.utils import get_linear_fn
+                start_lr = config.RESUME_OVERRIDES.get("lr_decay_start", model.learning_rate)
+                end_lr = config.RESUME_OVERRIDES["lr_decay_to"]
+                # get_linear_fn returns a schedule function of
+                # progress_remaining (1.0 at the start of THIS resumed
+                # run, decaying to 0.0 at total_timesteps) -- SB3 calls
+                # this internally every rollout to update the actual
+                # optimizer learning rate, so this DOES take real effect
+                # going forward, unlike just setting model.learning_rate
+                # to a plain float (which a schedule-driving algorithm
+                # like PPO will overwrite anyway).
+                model.lr_schedule = get_linear_fn(start_lr, end_lr, 1.0)
+                print(f"Set learning_rate to decay linearly from {start_lr} to {end_lr} "
+                      f"over the remaining training.")
     else:
         if args.warmstart:
             bc_path = "./checkpoints/bc_pretrained.zip"
