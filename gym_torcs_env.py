@@ -12,11 +12,26 @@ Architecture overview:
         ↕  numpy arrays
     PPO agent (stable-baselines3, separate training script)
 
+Responsibilities of THIS file
+------------------------------
+  - Gym spaces definition (observation / action).
+  - UDP lifecycle: connect, send action, receive obs, reconnect on crash.
+  - State vector construction (_build_state_vector).
+  - Rule-based actuator helpers (_auto_gear, _apply_traction_control,
+    reverse-assist logic).
+  - Orchestration of the per-step loop: reward, termination, logging.
+
+What this file deliberately does NOT contain
+---------------------------------------------
+  - Reward arithmetic  →  reward.py
+  - Termination logic  →  termination.py
+  - CSV logging        →  episode_logger.py
+
 Design decisions:
     - Windows-native: no os.system('pkill'), no shell scripts.
       You start TORCS manually before running the training script.
-    - 65-dim state vector: same structure for single-car and multi-car.
-      Single-car fills opponent sensors with max-range values (200m).
+    - 29-dim state vector (opponents removed -- constant noise in single-car
+      training).
     - 3-dim continuous action: steer, accel, brake. Gear is rule-based.
     - Composite reward with configurable weights from config.py.
     - Per-episode CSV logging for thesis data collection.
@@ -36,11 +51,8 @@ Usage:
 """
 
 import math
-import os
-import csv
 import time
 import numpy as np
-from datetime import datetime
 
 # --- Gymnasium import (required for SB3 v2+) ---
 try:
@@ -53,12 +65,23 @@ except ImportError:
 
 # --- Project imports ---
 import config
+from reward import (
+    EpisodeRewardState,
+    RunRewardState,
+    fresh_episode_state,
+    compute_reward,
+)
+from termination import (
+    TerminationState,
+    fresh_termination_state,
+    check_terminal,
+)
+from episode_logger import EpisodeLogger
 
 try:
     from snakeoil3_gym import Client
 except ImportError:
     try:
-        # Fallback: some project layouts put the Client in a different module
         from torcs_jm_par import Client
     except ImportError:
         raise ImportError(
@@ -72,7 +95,6 @@ except ImportError:
 # ================================================================
 
 # Normalization divisors: map raw sensor ranges to roughly [-1, 1] or [0, 1].
-# These are the approximate maximum magnitudes for each sensor.
 NORM = {
     "angle":        math.pi,   # radians, range [-pi, pi]
     "trackPos":     2.0,       # clip to [-2, 2] first, then /2 → [-1, 1]
@@ -85,7 +107,6 @@ NORM = {
 }
 
 # Rule-based gear shifting thresholds (km/h).
-# Index 0 → gear 1, index 1 → gear 2, etc.
 GEAR_THRESHOLDS = [0, 20, 40, 80, 100, 180]
 
 
@@ -113,7 +134,7 @@ class TorcsEnv(gym.Env):
     """
     Gymnasium environment wrapping TORCS via the SCR UDP protocol.
 
-    Observation space: Box(-1, 1, shape=(65,))
+    Observation space: Box(-1, 1, shape=(29,))
         See _build_state_vector() for the exact layout.
 
     Action space: Box([-1, 0, 0], [1, 1, 1], shape=(3,))
@@ -130,25 +151,17 @@ class TorcsEnv(gym.Env):
 
     def __init__(self, port=None, host=None):
         """
-        Create the environment. Does NOT connect to TORCS yet --
+        Create the environment.  Does NOT connect to TORCS yet --
         the connection is established on the first reset() call.
-
-        Args:
-            port: TORCS server port (default from config.py)
-            host: TORCS server host (default from config.py)
         """
         super().__init__()
 
-        # Connection parameters
         self.port = port or config.TORCS_PARAMS["port"]
         self.host = host or config.TORCS_PARAMS["host"]
 
-        # --- Define Gym spaces ---
+        # --- Gym spaces ---
         self.observation_space = spaces.Box(
-            low=-1.0,
-            high=1.0,
-            shape=(config.STATE_DIM,),
-            dtype=np.float32,
+            low=-1.0, high=1.0, shape=(config.STATE_DIM,), dtype=np.float32,
         )
         self.action_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
@@ -156,35 +169,28 @@ class TorcsEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # --- Internal bookkeeping ---
-        self.client = None          # snakeoil3 Client instance
-        self.time_step = 0          # Steps elapsed in current episode
-        self.prev_obs_raw = None    # Previous frame's raw sensor dict
-        self.prev_steer = None      # Previous step's steer action (for smoothness penalty)
-        self.wall_pinned_counter = 0  # Consecutive steps spent jammed against the wall (for termination)
-        self.out_of_track_counter = 0  # Consecutive steps off-track (grace period before termination)
-        self.in_track_streak = 0       # Consecutive steps back IN bounds (must sustain this to clear the counter)
-        # PERSISTENT across episodes (deliberately NOT reset in reset()
-        # -- this is a single running high-water mark for the whole
-        # training run, see _compute_record_reward). KNOWN LIMITATION:
-        # this is in-memory only, not saved/restored with model
-        # checkpoints -- if you stop and --resume training later, this
-        # restarts from 0, meaning the first new max after a resume will
-        # likely trigger a (probably undeserved, since it's not a TRUE
-        # all-time record) payout. Acceptable given time constraints,
-        # but worth knowing if you see an unexplained reward spike right
-        # after a --resume.
-        self.furthest_distance_ever = 0.0
-        self.checkpoints_reached = set()  # Which distance checkpoints (config.REWARD_PARAMS["checkpoints"]) have already paid out this episode
-        self.low_speed_counter = 0  # Consecutive steps below stuck_speed_threshold (resets the moment speed recovers)
-        self.pinned_duration = 0      # Separate counter used to trigger reverse-gear assist
-        self.prev_dist_from_start = None  # For lap-completion detection
-        self.is_initial_reset = True      # True until first reset() finishes
+        # --- UDP client ---
+        self.client = None
+        self.is_initial_reset = True
+
+        # --- Previous raw obs (needed by termination damage check) ---
+        self.prev_obs_raw = None
+
+        # ---- Episode-scoped state --------------------------------
+        # These are reset by _reset_episode_state() at every episode start.
+        self.ep_reward_state: EpisodeRewardState = fresh_episode_state()
+        self.term_state:      TerminationState   = fresh_termination_state()
+        self.pinned_duration: int  = 0   # Reverse-assist gear logic counter
+        self.time_step:       int  = 0
+
+        # ---- Run-scoped state (intentionally NOT reset each episode) ----
+        # furthest_distance_ever is the single global high-water mark.
+        # See reward.py RunRewardState for the known --resume limitation.
+        self.run_reward_state: RunRewardState = RunRewardState()
 
         # --- Logging ---
         self.episode_count = 0
-        self._log_file = None
-        self._log_writer = None
+        self._logger: EpisodeLogger | None = None
 
     # ============================================================
     #  reset()
@@ -199,63 +205,63 @@ class TorcsEnv(gym.Env):
             2. Close the old UDP socket.
             3. Open a new UDP connection (new Client).
             4. Read the initial sensor data.
-            5. Return the normalized 65-dim observation + info dict.
-
-        If TORCS has crashed, this will detect it, pause and prompt you
-        to manually restart TORCS, then retry automatically once you
-        confirm it is ready.
-
-        IMPORTANT: TORCS must already be running and showing the
-        "waiting for connection" screen before you call this.
+            5. Return the normalized 29-dim observation + info dict.
         """
         super().reset(seed=seed)
 
-        while True:  # Retry loop: keeps trying until a connection succeeds
+        while True:
             try:
-                # --- Tell TORCS to restart (skip on the very first call) ---
                 if not self.is_initial_reset and self.client is not None:
                     self._send_restart()
-
-                # --- Close old connection ---
                 self._disconnect()
-
-                # --- Open new connection ---
                 self.client = Client(p=self.port, H=self.host)
                 self._safe_get_input(max_retries=10)
                 raw_obs = self.client.S.d
-                break  # Success -- exit the retry loop
-
+                break
             except TorcsCrashError as e:
                 self._wait_for_manual_restart(e)
-                # Loop back and try again from scratch.
 
-        # --- Reset episode state ---
-        self.time_step = 0
-        # IMPORTANT: must copy, not alias. self.client.S.d is mutated
-        # in place by snakeoil3's parse_server_str() on every frame, so
-        # storing a bare reference here would make prev_obs_raw silently
-        # track the SAME dict as the current obs on the next step,
-        # permanently breaking any "did this value change?" comparison
-        # (this is exactly what made damage-based collision detection
-        # never fire, despite damage clearly rising in the logs).
-        self.prev_obs_raw = dict(raw_obs)
-        self.prev_dist_from_start = raw_obs.get("distFromStart", 0)
-        self.prev_steer = None
-        self.wall_pinned_counter = 0
-        self.out_of_track_counter = 0
-        self.in_track_streak = 0
-        self.checkpoints_reached = set()
-        self.low_speed_counter = 0
-        self.pinned_duration = 0
-        self.is_initial_reset = False
+        # --- Close previous episode log (if any) ---
+        if self._logger is not None:
+            self._logger.close()
 
-        # --- Start episode log ---
-        self._init_episode_log()
+        # --- Reset all episode-scoped state ---
+        self._reset_episode_state(raw_obs)
 
-        # --- Build observation ---
+        # --- Open new episode log ---
+        self.episode_count += 1
+        self._logger = EpisodeLogger(self.episode_count)
+
         state = self._build_state_vector(raw_obs)
-        info = {"raw_obs": raw_obs}
+        info  = {"raw_obs": raw_obs}
         return state, info
+
+    def _reset_episode_state(self, raw_obs: dict) -> None:
+        """
+        Reset all per-episode counters and state objects.
+
+        IMPORTANT: run_reward_state (furthest_distance_ever) is NOT touched
+        here -- it is deliberately persistent across episodes.
+        """
+        # Episode-scoped reward state (prev_steer, checkpoints_reached)
+        self.ep_reward_state = fresh_episode_state()
+
+        # Episode-scoped termination counters
+        self.term_state = fresh_termination_state(
+            initial_dist_from_start=raw_obs.get("distFromStart", 0)
+        )
+
+        # Reverse-assist counter
+        self.pinned_duration = 0
+
+        # Step counter
+        self.time_step = 0
+
+        # Snapshot of obs for the next step's damage-delta check
+        # IMPORTANT: must copy, not alias -- client.S.d is mutated in place.
+        self.prev_obs_raw = dict(raw_obs)
+
+        self.is_initial_reset = False
 
     # ============================================================
     #  step()
@@ -272,34 +278,21 @@ class TorcsEnv(gym.Env):
                 [2] brake  in [0, 1]
 
         Returns:
-            observation:  np.array shape (65,)
+            observation:  np.array shape (29,)
             reward:       float
-            terminated:   bool (episode ended by game logic)
-            truncated:    bool (episode ended by time limit)
-            info:         dict with debugging / logging data
+            terminated:   bool
+            truncated:    bool
+            info:         dict
         """
         # ------ 1. Parse and clip action ------
-        steer = float(np.clip(action[0], -1.0, 1.0))
-        accel = float(np.clip(action[1],  0.0, 1.0))
-        brake = float(np.clip(action[2],  0.0, 1.0))
+        steer = float(np.clip(action[0], -1.0,  1.0))
+        accel = float(np.clip(action[1],  0.0,  1.0))
+        brake = float(np.clip(action[2],  0.0,  1.0))
 
-        # ------ 1b. Traction control filter (deterministic, not learned) ------
-        # Same actuator-level safety net as gear shifting: dampens accel
-        # when the rear wheels are spinning noticeably faster than the
-        # front ones (tire slip), rather than leaving full wheelspin
-        # unchecked. This is a physical safety filter, not a strategic
-        # choice the agent needs to learn, so it's applied here just like
-        # the rule-based driver's original traction_control() did.
+        # ------ 1b. Traction control (deterministic, not learned) ------
         accel = self._apply_traction_control(accel)
 
-        # ------ 1c. Reverse-assist gear logic (no override of steer/accel) ------
-        # Uses the sensor reading from BEFORE this step's action (i.e. the
-        # state the agent is currently reacting to) to decide whether the
-        # car has been wall-pinned long enough to switch to reverse gear.
-        # The agent's own steer/accel values are untouched -- only the
-        # gear they get applied through changes, so if the agent steers
-        # away from the wall while this fires, it will genuinely
-        # experience successful reversing as a result of its OWN choice.
+        # ------ 1c. Reverse-assist gear logic ------
         prior_obs = self.client.S.d
         ep = config.EPISODE_PARAMS
         if (abs(prior_obs.get("trackPos", 0.0)) > ep["wall_pinned_trackpos_threshold"]
@@ -321,72 +314,77 @@ class TorcsEnv(gym.Env):
         self.client.R.d["clutch"] = 0
         self.client.R.d["meta"]   = 0
 
-        # ------ 3. Exchange with TORCS (crash-safe) ------
+        # ------ 3. Exchange with TORCS ------
         try:
             self._safe_respond()
             self._safe_get_input(max_retries=10)
             raw_obs = self.client.S.d
         except TorcsCrashError as e:
             self._wait_for_manual_restart(e)
-            # We cannot continue this episode -- TORCS lost its state.
-            # Tell the caller this episode is truncated (not a normal
-            # termination) so the training script knows to call reset().
-            self._close_episode_log()
-            # Return the last known good observation as a placeholder;
-            # the training script must call reset() immediately after this.
+            if self._logger is not None:
+                self._logger.close()
+                self._logger = None
             state = self._build_state_vector(self.prev_obs_raw or {})
-            info = {
-                "raw_obs": self.prev_obs_raw or {},
-                "reward_info": {},
+            info  = {
+                "raw_obs":        self.prev_obs_raw or {},
+                "reward_info":    {},
                 "terminal_reason": "torcs_crash",
-                "time_step": self.time_step,
+                "time_step":       self.time_step,
             }
             return state, 0.0, False, True, info
 
         # ------ 4. Build normalized state ------
         state = self._build_state_vector(raw_obs)
 
-        # ------ 5. Compute per-step reward ------
-        reward, reward_info = self._compute_reward(raw_obs, steer)
+        # ------ 5. Termination check (must come before reward so that
+        #            terminal_reason is available to reward functions) ------
+        terminated, truncated, terminal_reason, self.term_state = check_terminal(
+            obs=raw_obs,
+            prev_obs=self.prev_obs_raw,
+            time_step=self.time_step,
+            state=self.term_state,
+        )
 
-        # ------ 6. Check termination ------
-        terminated, truncated, terminal_reason = self._check_terminal(raw_obs)
+        # ------ 6. Compute composite reward ------
+        reward, reward_info, self.ep_reward_state, self.run_reward_state = compute_reward(
+            obs=raw_obs,
+            steer=steer,
+            accel=accel,
+            brake=brake,
+            ep_state=self.ep_reward_state,
+            run_state=self.run_reward_state,
+            terminal_reason=terminal_reason,
+        )
 
-        # ------ 7. Add one-time terminal reward if episode is ending ------
-        terminal_reward = self._get_terminal_reward(terminal_reason)
-        reward += terminal_reward
-        reward_info["terminal"] = terminal_reward
+        # ------ 7. Log this step ------
+        if self._logger is not None:
+            self._logger.log_step(
+                time_step=self.time_step,
+                raw_obs=raw_obs,
+                action=action,
+                reward=reward,
+                reward_info=reward_info,
+                gear=gear,
+                terminal_reason=terminal_reason,
+            )
 
-        # ------ 7b. Add one-time checkpoint reward (sub-goal, see config) ------
-        checkpoint_reward = self._compute_checkpoint_reward(raw_obs, terminal_reason)
-        reward += checkpoint_reward
-        reward_info["checkpoint"] = checkpoint_reward
-
-        # ------ 7c. Add one-time record-breaking reward (new global max distance) ------
-        record_reward = self._compute_record_reward(raw_obs, terminal_reason)
-        reward += record_reward
-        reward_info["record"] = record_reward
-
-        # ------ 8. Log this step ------
-        self._log_step(raw_obs, action, reward, reward_info, terminal_reason)
-
-        # ------ 9. If episode is over, tell TORCS to restart ------
+        # ------ 8. If episode is over, signal TORCS and close log ------
         if terminated or truncated:
             self._send_restart()
-            self._close_episode_log()
+            if self._logger is not None:
+                self._logger.close()
+                self._logger = None
 
-        # ------ 10. Advance internal state ------
-        # Must copy (see note in reset()): client.S.d is mutated in place,
-        # so storing a bare reference here makes prev_obs_raw silently
-        # become the SAME object as next step's raw_obs.
+        # ------ 9. Advance internal state ------
+        # IMPORTANT: copy, not alias (client.S.d is mutated in place).
         self.prev_obs_raw = dict(raw_obs)
-        self.time_step += 1
+        self.time_step   += 1
 
         info = {
-            "raw_obs": raw_obs,
-            "reward_info": reward_info,
+            "raw_obs":         raw_obs,
+            "reward_info":     reward_info,
             "terminal_reason": terminal_reason,
-            "time_step": self.time_step,
+            "time_step":       self.time_step,
         }
         return state, reward, terminated, truncated, info
 
@@ -394,18 +392,9 @@ class TorcsEnv(gym.Env):
     #  State construction
     # ============================================================
 
-    def _build_state_vector(self, raw):
+    def _build_state_vector(self, raw) -> np.ndarray:
         """
-        Convert the raw TORCS sensor dictionary into a normalized
-        29-dimensional numpy array.
-
-        REDUCED from 65 dims: removed the 36-dim opponents sensor.
-        In single-car training, opponents always reads a constant
-        [200.0]*36 (no other car ever nearby) -- after normalization
-        that's a constant 1.0 across all 36 dims, every single step,
-        for the entire project. It carried zero information and only
-        diluted the genuinely useful signal (track sensors, trackPos)
-        by occupying more than half the input vector.
+        Build the 29-dimensional normalized observation vector.
 
         Layout (indices):
             [0]      angle           -- car heading vs track direction
@@ -414,22 +403,18 @@ class TorcsEnv(gym.Env):
             [3]      speedY          -- lateral speed
             [4]      speedZ          -- vertical speed
             [5:24]   track[0..18]    -- 19 range-finder distances
-            [24:28]  wheelSpinVel[0..3] -- 4 wheel rotation speeds
-            [28]     rpm             -- engine revs
+            [24:28]  wheelSpinVel[0..3]
+            [28]     rpm
         """
-        angle = raw.get("angle", 0.0) / NORM["angle"]
+        angle     = raw.get("angle",    0.0) / NORM["angle"]
         track_pos = np.clip(raw.get("trackPos", 0.0), -2.0, 2.0) / NORM["trackPos"]
-        speed_x = raw.get("speedX", 0.0) / NORM["speedX"]
-        speed_y = raw.get("speedY", 0.0) / NORM["speedY"]
-        speed_z = raw.get("speedZ", 0.0) / NORM["speedZ"]
+        speed_x   = raw.get("speedX",   0.0) / NORM["speedX"]
+        speed_y   = raw.get("speedY",   0.0) / NORM["speedY"]
+        speed_z   = raw.get("speedZ",   0.0) / NORM["speedZ"]
 
-        track = np.array(raw.get("track", [0.0] * 19), dtype=np.float32)
-        track = track / NORM["track"]
-
-        wsv = np.array(raw.get("wheelSpinVel", [0.0] * 4), dtype=np.float32)
-        wsv = wsv / NORM["wheelSpinVel"]
-
-        rpm = raw.get("rpm", 0.0) / NORM["rpm"]
+        track = np.array(raw.get("track", [0.0] * 19), dtype=np.float32) / NORM["track"]
+        wsv   = np.array(raw.get("wheelSpinVel", [0.0] * 4), dtype=np.float32) / NORM["wheelSpinVel"]
+        rpm   = raw.get("rpm", 0.0) / NORM["rpm"]
 
         state = np.concatenate([
             [angle, track_pos, speed_x, speed_y, speed_z],  # 5
@@ -441,26 +426,22 @@ class TorcsEnv(gym.Env):
         return np.clip(state, -1.0, 1.0)
 
     # ============================================================
-    #  Automatic gear shifting (rule-based, not learned by PPO)
+    #  Rule-based actuator helpers (not learned by PPO)
     # ============================================================
 
-    def _auto_gear(self, speed_x):
-        """
-        Simple rule: shift up when speed exceeds the threshold for that gear.
-        Uses the same thresholds as the user's existing drive_modular().
-        """
+    def _auto_gear(self, speed_x: float) -> int:
+        """Simple threshold-based gear shifting."""
         gear = 1
         for i, threshold in enumerate(GEAR_THRESHOLDS):
             if speed_x > threshold:
                 gear = i + 1
         return min(gear, 6)
 
-    def _apply_traction_control(self, accel):
+    def _apply_traction_control(self, accel: float) -> float:
         """
-        Dampens accel when the rear wheels are spinning noticeably faster
-        than the front wheels (a sign of tire slip / wheelspin rather than
-        actual grip). Mirrors the traction_control() logic from the
-        original rule-based driver (torcs_jm_par.py).
+        Dampen accel when rear wheels spin noticeably faster than front
+        wheels (tire slip).  Mirrors the original rule-based driver's
+        traction_control() from torcs_jm_par.py.
         """
         tc = config.TRACTION_CONTROL
         if not tc["enabled"]:
@@ -477,604 +458,47 @@ class TorcsEnv(gym.Env):
         return max(0.0, accel)
 
     # ============================================================
-    #  Reward: orchestrator
-    # ============================================================
-
-    def _compute_reward(self, obs, steer):
-        """
-        Compute the composite per-step reward.
-
-        R_total = w_core_progress * R_core_progress + w_safety * R_safety
-                  + w_smooth * R_smooth + w_anticipation * R_anticipation
-                  + time_penalty
-
-        RESTRUCTURED: previously R_speed (forward/lateral) and the
-        speedX*trackPos cross-term (inside R_safety) were computed
-        separately and combined via two independently-tuned weights
-        (w_speed=0.15, w_safety=1.0) -- this let the squared boundary
-        penalty's speed-INdependent magnitude get decoupled from the
-        speed-scaled terms, and contributed to the previously-measured
-        "speed reward = 126% of total" imbalance (check_reward_composition.py).
-        Direct comparison against a working reference PPO-for-TORCS
-        implementation showed its entire reward is ONE speed-scaled
-        formula: progress = sp*cos(angle) - |sp*sin(angle)| -
-        sp*|trackPos| -- meaning every component automatically goes to
-        zero as speed goes to zero, by construction, with no separate
-        weight to keep in balance. R_core_progress below adopts that
-        exact structure. R_safety now contains ONLY the squared
-        boundary penalty (deliberately speed-INDEPENDENT -- riding the
-        wall should be penalized even at low speed, this is an
-        intentional exception, not an oversight).
-
-        REMOVED: the standalone potential-based progress-shaping term
-        and the accel/brake pedal-conflict penalty (both retired --
-        see git history / project notes for why: the new core formula
-        and the policy-level sigma cap (capped_policy.py) are expected
-        to address what those two reward-side patches were compensating
-        for, from a different layer).
-
-        The time_penalty is a flat, unweighted constant applied every step
-        (see config.py REWARD_PARAMS["time_penalty"] for why).
-
-        Returns:
-            total_reward: float
-            info_dict:    dict of individual components (for logging)
-        """
-        w = config.REWARD_WEIGHTS
-
-        r_core_progress  = self._compute_core_progress_reward(obs)
-        r_safety         = self._compute_safety_reward(obs)
-        r_smooth         = self._compute_smoothness_reward(steer)
-        r_anticipation   = self._compute_anticipation_reward(obs)
-        r_time           = config.REWARD_PARAMS["time_penalty"]
-
-        total = (
-            w["w_core_progress"] * r_core_progress
-            + w["w_safety"] * r_safety
-            + w["w_smooth"] * r_smooth
-            + w["w_anticipation"] * r_anticipation
-            + r_time
-        )
-
-        info = {
-            "r_core_progress": r_core_progress,
-            "r_safety": r_safety,
-            "r_smooth": r_smooth,
-            "r_anticipation": r_anticipation,
-            "r_time":   r_time,
-        }
-        return total, info
-
-    # ============================================================
-    #  Reward: core progress component (speed-scaled, REPLACES old
-    #  R_speed + the speedX*trackPos cross-term formerly in R_safety)
-    # ============================================================
-
-    def _compute_core_progress_reward(self, obs):
-        """
-        R_core_progress = speedX*cos(angle)
-                           - speedX*|sin(angle)| * lateral_penalty_k
-                           - speedX*|trackPos|   * core_progress_beta
-
-        Directly modeled on a working reference PPO-for-TORCS
-        implementation's entire reward function. All three terms share
-        speedX as a multiplicative factor, so the WHOLE thing collapses
-        toward zero as the car slows toward a stop -- this is the
-        single biggest structural difference from this project's
-        previous reward design, where a speed-independent squared
-        boundary penalty (still present, see _compute_safety_reward)
-        and other speed-independent terms could keep firing even when
-        the car wasn't moving, diluting the "low speed = low reward
-        either way" property the reference design has by construction.
-
-        Term 1 (forward): rewards progress along the track direction;
-            full credit when heading matches track direction
-            (cos(angle)~=1), reduced when sideways.
-        Term 2 (lateral): penalizes heading-angle mismatch scaled by
-            speed -- "snaking"/weaving while moving fast is penalized
-            more than while moving slow.
-        Term 3 (trackPos cross-term): penalizes positional deviation
-            from center scaled by speed -- drifting off-center fast is
-            penalized more than drifting slowly. This is the term that
-            used to live inside _compute_safety_reward as
-            "safety_speed_beta"; moved here so it shares the same
-            speed-scaling property as the other two terms instead of
-            being bundled with the speed-INDEPENDENT boundary penalty.
-        """
-        speed_x   = obs.get("speedX", 0.0)
-        angle     = obs.get("angle", 0.0)
-        track_pos = obs.get("trackPos", 0.0)
-        p = config.REWARD_PARAMS
-
-        forward = speed_x * math.cos(angle)
-        lateral = speed_x * abs(math.sin(angle)) * p["lateral_penalty_k"]
-        position_cross = speed_x * abs(track_pos) * p["core_progress_beta"]
-
-        return forward - lateral - position_cross
-
-    # ============================================================
-    #  Reward: safety component (speed-INDEPENDENT boundary penalty only)
-    # ============================================================
-
-    def _compute_safety_reward(self, obs):
-        """
-        R_safety = -max(0, |trackPos| - safety_margin)^2
-
-        Deliberately speed-INDEPENDENT: riding the wall should be
-        penalized even at low/zero speed (e.g. while stopped pinned
-        against a barrier), so this term is kept separate from the new
-        speed-scaled core progress term rather than folded into it.
-        Fires only once the car is meaningfully off-center, and grows
-        fast (squared) as it gets closer to the edge.
-
-        The speed-scaled trackPos deviation term that used to live
-        here (safety_speed_beta) has moved into
-        _compute_core_progress_reward, since it shares that function's
-        "scales toward zero at low speed" property and doesn't belong
-        with this speed-independent boundary term.
-
-        Multi-car stage (future):
-            Will be extended to incorporate opponent proximity penalty.
-        """
-        track_pos = abs(obs.get("trackPos", 0.0))
-        margin    = config.REWARD_PARAMS["safety_margin"]
-
-        if track_pos > margin:
-            return -((track_pos - margin) ** 2)
-        return 0.0
-
-    # ============================================================
-    def _compute_smoothness_reward(self, steer):
-        """
-        Penalizes large frame-to-frame changes in the steering action.
-
-        Without this, nothing discourages the network from slamming the
-        wheel from one extreme to the other -- which is exactly the
-        "learns to correct away from the wall, but overcorrects and spins
-        out the other side" behavior observed in training. This nudges
-        the policy toward gradual, controlled steering adjustments instead
-        of abrupt full-lock corrections.
-        """
-        if self.prev_steer is None:
-            delta = 0.0
-        else:
-            delta = abs(steer - self.prev_steer)
-        self.prev_steer = steer
-        k = config.REWARD_PARAMS["smoothness_k"]
-        return -k * delta
-
-    def _compute_anticipation_reward(self, obs):
-        """
-        Penalizes maintaining high speed when the front-facing distance
-        sensors show the track narrowing ahead (an approaching corner).
-
-        Logic:
-            1. Look across the sensor sweep (now the FULL -90deg to
-               +90deg range, all 19 sensors -- widened again from an
-               earlier -50/+50 cone specifically to catch hairpin
-               turns, where the apex wall first appears at wide angles
-               while center sensors still read open track down the
-               corner's "throat") and take the MINIMUM reading -- the
-               most conservative estimate of how much open track is
-               ahead.
-            2. Convert that distance into a "safe speed" estimate using
-               a sqrt relationship (safe_speed = k * sqrt(distance)),
-               grounded in centripetal force physics: max cornering
-               speed scales with sqrt(radius), not linearly with it.
-               This is more conservative at larger clearances than the
-               earlier linear formula, and capped at a maximum so long
-               straights are never penalized.
-            3. If current speed exceeds that safe estimate, penalize the
-               excess. If not, this term is zero -- it never tells the
-               agent HOW to brake or steer, only that going this fast
-               with this little clearance ahead is undesirable.
-
-        Revised after grid search data showed out_of_track as the
-        dominant failure mode (~70% of episodes, vs ~5% collision), and
-        raising w_safety made it WORSE, not better -- pointing at a
-        detection-timing problem (the old narrow cone + linear formula
-        let the car see corners too late and underestimated how much
-        it needed to slow down), not a penalty-magnitude problem.
-        """
-        p = config.REWARD_PARAMS
-        track = obs.get("track", [200.0] * 19)
-        indices = p["anticipation_sensor_indices"]
-        sensors = [track[i] for i in indices if i < len(track)]
-        forward_distance = max(min(sensors) if sensors else 200.0, 0.0)
-
-        safe_speed = min(
-            p["anticipation_speed_per_sqrt_meter"] * math.sqrt(forward_distance),
-            p["anticipation_max_safe_speed"],
-        )
-
-        speed_x = obs.get("speedX", 0.0)
-        excess = max(0.0, speed_x - safe_speed)
-        return -excess
-
-    # ============================================================
-    #  Reward: terminal (one-time, applied when episode ends)
-    # ============================================================
-
-    def _get_terminal_reward(self, reason):
-        """
-        One-shot reward/penalty at the moment the episode terminates.
-        Only called when terminated=True or truncated=True.
-        """
-        p = config.REWARD_PARAMS
-
-        if reason == "collision":
-            return p["collision_penalty"]
-        elif reason == "out_of_track":
-            return p["out_of_track_penalty"]
-        elif reason == "stuck" or reason == "wall_pinned":
-            return p["stuck_penalty"]
-        elif reason == "backward":
-            return p["backward_penalty"]
-        elif reason == "lap_complete":
-            return p["lap_complete_bonus"]
-        # "max_steps" (truncated) or empty reason: no extra reward
-        return 0.0
-
-    def _compute_checkpoint_reward(self, obs, terminal_reason):
-        """
-        One-time bonus the first time distRaced crosses each configured
-        checkpoint distance within an episode (config.REWARD_PARAMS
-        ["checkpoints"]). Added because the per-step reward terms are
-        all "direction"-shaped (reward fast/centered driving moment to
-        moment) but nothing directly credits actually covering ground
-        on this specific track -- giving the agent achievable
-        intermediate sub-goals on the way to a full lap, scaled to fit
-        this project's existing terminal-reward convention (tens, with
-        lap_complete_bonus=150 as the ceiling -- NOT the much larger
-        "thousands" scale used in a separate, unrelated experiment
-        branch of this project).
-
-        Checkpoints are placed at 25/50/75% of the known Corkscrew lap
-        length (3608.45m -> ~900/1800/2700m), so the first one already
-        requires getting through the early part of the track -- including
-        whatever corner is currently causing the car to stop short.
-
-        Guards against the same "farm it by oscillating across the
-        line" exploit class as the out_of_track grace-period logic: a
-        checkpoint only pays out ONCE per episode (self.checkpoints_reached),
-        and not at all if THIS step is simultaneously a collision/
-        out_of_track termination (i.e. the car didn't actually clear it
-        safely, it just happened to cross the distance threshold at the
-        moment it crashed/left the track).
-        """
-        dist_raced = obs.get("distRaced", 0.0)
-        total_bonus = 0.0
-
-        if terminal_reason in ("collision", "out_of_track"):
-            return 0.0
-
-        for checkpoint_distance, bonus in config.REWARD_PARAMS["checkpoints"]:
-            if checkpoint_distance in self.checkpoints_reached:
-                continue
-            if dist_raced >= checkpoint_distance:
-                self.checkpoints_reached.add(checkpoint_distance)
-                total_bonus += bonus
-
-        return total_bonus
-
-    def _compute_record_reward(self, obs, terminal_reason):
-        """
-        One-time bonus when distRaced reaches a NEW all-time high for
-        this training run (not per-episode -- a single global
-        high-water mark, see self.furthest_distance_ever, deliberately
-        persistent across episodes).
-
-        Directly serves the priority shift to "just finish a lap,
-        speed doesn't matter": this rewards genuinely exploring further
-        than the policy has EVER gotten before, regardless of how slow
-        or fast it got there.
-
-        Safe by construction against the oscillation-farming exploit
-        found elsewhere in this project: the high-water mark only ever
-        increases (line below), so the same ground can never pay out
-        twice -- there's no way to "flicker" past a point repeatedly to
-        re-trigger this.
-
-        Requires beating the old record by at least
-        record_min_improvement meters (not just any improvement,
-        however tiny) -- without this, ordinary random fluctuation of a
-        few centimeters past the previous max would constantly trigger
-        trivial, noisy payouts that don't represent real progress.
-
-        Does not pay out if this same step is a collision/out_of_track
-        termination (consistent with the checkpoint reward's logic --
-        crossing the line at the exact moment of crashing doesn't count
-        as a genuine, safe breakthrough).
-        """
-        if terminal_reason in ("collision", "out_of_track"):
-            return 0.0
-
-        p = config.REWARD_PARAMS
-        dist_raced = obs.get("distRaced", 0.0)
-
-        if dist_raced < self.furthest_distance_ever + p["record_min_improvement"]:
-            return 0.0
-
-        self.furthest_distance_ever = dist_raced
-        return p["record_reward_k"] * (dist_raced ** 0.5)
-
-    # ============================================================
-    #  Termination logic
-    # ============================================================
-
-    def _check_terminal(self, obs):
-        """
-        Determine whether the current episode should end.
-
-        Returns:
-            terminated: bool -- ended by game logic (crash, stuck, lap done)
-            truncated:  bool -- ended by step limit
-            reason:     str  -- human-readable label for logging / analysis
-        """
-        # --- Collision (damage-based, checked first) ---
-        # Direct physics-engine signal: TORCS increments 'damage' whenever
-        # the car hits something, regardless of where the impact happens
-        # geometrically. This catches impacts that trackPos misses -- log
-        # analysis found a high-speed hit (92.7 -> 58.5 km/h in one step)
-        # at a track location where trackPos never crossed the
-        # out-of-track threshold, leaving the car to drag itself for ~100
-        # more undetected steps before the generic stuck check finally
-        # ended the episode.
-        prev_damage = self.prev_obs_raw.get("damage", 0.0) if self.prev_obs_raw else 0.0
-        if obs.get("damage", 0.0) - prev_damage > 0:
-            return True, False, "collision"
-
-        # --- Out of track (soft, grace-period -- no longer instant) ---
-        # Previously terminated the instant |trackPos| > 1.0. Softened
-        # because instant termination only teaches the agent to AVOID
-        # ever crossing the line, never to RECOVER once it has -- and
-        # combined with the other per-step penalties largely vanishing
-        # at low speed (see anticipation/smoothness below), this was
-        # part of what made "just stop before the corner" look like a
-        # safer bet than attempting it. The car now gets
-        # out_of_track_grace_steps consecutive steps to steer back onto
-        # the track before the episode actually ends. The continuous
-        # squared R_safety penalty still grows the further past 1.0 the
-        # car drifts, so there's no incentive to linger off-track on
-        # purpose -- this only removes the IMMEDIATE reset.
-        #
-        # Anti-flicker fix included from the start (not bolted on after
-        # the fact): the off-track counter is NOT cleared by a single
-        # in-bounds frame. The car must stay continuously within bounds
-        # for out_of_track_recovery_streak_required steps before the
-        # counter resets -- otherwise an agent could learn to "flicker"
-        # back and forth across the boundary, never accumulating enough
-        # consecutive off-track steps to trigger termination while still
-        # effectively riding/cutting along the edge indefinitely.
-        ep = config.EPISODE_PARAMS
-        if abs(obs.get("trackPos", 0.0)) > 1.0:
-            self.out_of_track_counter += 1
-            self.in_track_streak = 0
-            if self.out_of_track_counter > ep["out_of_track_grace_steps"]:
-                return True, False, "out_of_track"
-        else:
-            self.in_track_streak += 1
-            if self.in_track_streak >= ep["out_of_track_recovery_streak_required"]:
-                self.out_of_track_counter = 0
-
-        # --- Running backward ---
-        if math.cos(obs.get("angle", 0.0)) < 0:
-            return True, False, "backward"
-
-        # --- Wall-pinned (fast timeout) ---
-        # A much shorter timer than the generic stuck check below,
-        # specifically for cars jammed against the track edge with
-        # almost no speed -- a dead-end situation with no recovery
-        # value, so we end it quickly instead of burning the full
-        # stuck_time_limit. See config.py EPISODE_PARAMS for rationale.
-        ep = config.EPISODE_PARAMS
-        track_pos_abs = abs(obs.get("trackPos", 0.0))
-        if (track_pos_abs > ep["wall_pinned_trackpos_threshold"]
-                and obs.get("speedX", 0.0) < ep["wall_pinned_speed_threshold"]):
-            self.wall_pinned_counter += 1
-            if self.wall_pinned_counter > ep["wall_pinned_time_limit"]:
-                return True, False, "wall_pinned"
-        else:
-            self.wall_pinned_counter = 0
-
-        # --- Stuck (too slow for too long, CONSECUTIVELY) ---
-        # FIXED: the previous version checked "has total time_step
-        # passed stuck_time_limit AND is speed low RIGHT NOW", which has
-        # two opposite problems: (1) the pre-race countdown (car
-        # naturally stationary for the first ~50 steps of every episode)
-        # eats into that same budget, so a car that's merely slow to get
-        # going could get unfairly cut off right as it's starting; (2) a
-        # car briefly slowing to navigate a tight corner at any point
-        # after the threshold would get wrongly flagged as "stuck" even
-        # though it's driving normally, since the check only looks at
-        # one instant, not whether it's ACTUALLY been stuck for a
-        # sustained stretch. Now tracks a consecutive low-speed counter
-        # that resets to 0 the moment speed recovers above the
-        # threshold -- so the countdown doesn't count against the
-        # budget as long as the car accelerates normally afterward, and
-        # a momentary slow corner doesn't wrongly trigger this either.
-        if obs.get("speedX", 0.0) < ep["stuck_speed_threshold"]:
-            self.low_speed_counter += 1
-            if self.low_speed_counter > ep["stuck_time_limit"]:
-                return True, False, "stuck"
-        else:
-            self.low_speed_counter = 0
-
-        # --- Lap completed ---
-        # Detection: distFromStart jumps from a large value back near 0
-        # when the car crosses the start/finish line.
-        #
-        # IMPORTANT SAFETY CHECK: the car's spawn point can sit just a few
-        # meters before the finish line (confirmed from logged data: cars
-        # were spawning at distFromStart=6351.65 and reaching the finish
-        # line after only ~4m of distRaced). Without a minimum-distance
-        # guard, this falsely triggers "lap_complete" almost immediately
-        # after every reset, handing out the +50 bonus for doing nothing.
-        # We therefore require distRaced to exceed a conservative threshold
-        # before accepting the jump as a genuine lap completion.
-        dist = obs.get("distFromStart", 0.0)
-        dist_raced = obs.get("distRaced", 0.0)
-        if self.prev_dist_from_start is not None:
-            delta = dist - self.prev_dist_from_start
-            # A large negative jump means the car crossed the finish line.
-            # Threshold -1000 avoids false triggers from small fluctuations.
-            if delta < -1000:
-                self.prev_dist_from_start = dist
-                if dist_raced >= ep["min_dist_for_lap"]:
-                    return True, False, "lap_complete"
-                else:
-                    # Spawn-point artifact, not a real lap. Treat it as a
-                    # normal continuing step -- do NOT terminate, do NOT
-                    # award the bonus.
-                    pass
-        self.prev_dist_from_start = dist
-
-        # --- Step limit ---
-        if self.time_step >= ep["max_steps"]:
-            return False, True, "max_steps"
-
-        # --- Episode continues ---
-        return False, False, ""
-
-    # ============================================================
-    #  Logging: per-episode CSV files for thesis data analysis
-    # ============================================================
-
-    def _init_episode_log(self):
-        """Create a new CSV file for the current episode."""
-        if not config.LOGGING["enabled"]:
-            return
-
-        log_dir = config.LOGGING["log_dir"]
-        os.makedirs(log_dir, exist_ok=True)
-
-        self.episode_count += 1
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"ep{self.episode_count:05d}_{timestamp}.csv"
-        filepath = os.path.join(log_dir, filename)
-
-        self._log_file = open(filepath, "w", newline="")
-        self._log_writer = csv.writer(self._log_file)
-
-        # CSV header -- each column maps to a thesis analysis metric
-        self._log_writer.writerow([
-            "step",
-            # Raw sensor readings (for trajectory / behavior analysis)
-            "speedX", "speedY", "angle", "trackPos",
-            "distFromStart", "distRaced", "damage",
-            # Actions taken by the agent
-            "steer", "accel", "brake", "gear",
-            # Reward breakdown (for ablation comparison)
-            "r_core_progress", "r_safety", "r_smooth", "r_anticipation", "r_time", "r_terminal", "r_checkpoint", "r_record", "reward_total",
-            # Episode event
-            "terminal_reason",
-        ])
-
-    def _log_step(self, raw_obs, action, reward, reward_info, terminal_reason):
-        """Write one row to the episode CSV."""
-        if self._log_writer is None:
-            return
-
-        self._log_writer.writerow([
-            self.time_step,
-            raw_obs.get("speedX", 0),
-            raw_obs.get("speedY", 0),
-            raw_obs.get("angle", 0),
-            raw_obs.get("trackPos", 0),
-            raw_obs.get("distFromStart", 0),
-            raw_obs.get("distRaced", 0),
-            raw_obs.get("damage", 0),
-            float(action[0]),
-            float(action[1]),
-            float(action[2]),
-            self.client.R.d.get("gear", 0),
-            reward_info.get("r_core_progress", 0),
-            reward_info.get("r_safety", 0),
-            reward_info.get("r_smooth", 0),
-            reward_info.get("r_anticipation", 0),
-            reward_info.get("r_time", 0),
-            reward_info.get("terminal", 0),
-            reward_info.get("checkpoint", 0),
-            reward_info.get("record", 0),
-            reward,
-            terminal_reason,
-        ])
-
-    def _close_episode_log(self):
-        """Flush and close the current episode's CSV file."""
-        if self._log_file is not None:
-            self._log_file.close()
-            self._log_file = None
-            self._log_writer = None
-
-    # ============================================================
     #  Fault-tolerant communication with TORCS
     # ============================================================
-    #
-    # IMPORTANT: the original snakeoil3 Client.get_servers_input() has an
-    # infinite `while True` loop that retries forever if no data arrives.
-    # If TORCS crashes, that call would hang the whole training run
-    # forever -- it never raises an exception, it just sits there silently.
-    # The methods below replace it with a BOUNDED retry that gives up
-    # after a fixed number of timeouts and raises TorcsCrashError instead,
-    # so the training script can catch it and recover.
 
-    def _safe_get_input(self, max_retries=10):
+    def _safe_get_input(self, max_retries=10) -> None:
         """
         Bounded-retry replacement for client.get_servers_input().
-
-        Each retry waits up to 1 second (the socket timeout set by
-        snakeoil3). After `max_retries` consecutive timeouts with no
-        data at all, we conclude TORCS has crashed and raise
-        TorcsCrashError instead of hanging forever.
+        Raises TorcsCrashError after max_retries consecutive timeouts.
         """
         sock = self.client.so
-        for attempt in range(max_retries):
+        for _ in range(max_retries):
             try:
                 sockdata, _addr = sock.recvfrom(2 ** 17)
                 sockdata = sockdata.decode("utf-8")
             except OSError:
-                # Timeout or socket error -- TORCS may be slow or dead.
                 continue
 
             if not sockdata:
                 continue
             if "***identified***" in sockdata:
-                continue  # Handshake echo, keep waiting for real data.
+                continue
             if "***shutdown***" in sockdata or "***restart***" in sockdata:
-                # TORCS itself ended the race -- not a crash, just a
-                # normal end-of-race signal. Treat as a clean termination.
                 raise TorcsCrashError(
-                    "TORCS sent a shutdown/restart signal mid-step. "
-                    "This usually means the race ended unexpectedly."
+                    "TORCS sent a shutdown/restart signal mid-step."
                 )
-
-            # Got real sensor data -- success.
             self.client.S.parse_server_str(sockdata)
             return
 
-        # Exhausted all retries with no usable data: TORCS is unresponsive.
         raise TorcsCrashError(
-            f"No response from TORCS after {max_retries} attempts "
-            f"(~{max_retries} seconds). TORCS has likely crashed."
+            f"No response from TORCS after {max_retries} attempts. "
+            "TORCS has likely crashed."
         )
 
-    def _safe_respond(self):
-        """
-        Bounded version of client.respond_to_server(). Sending is UDP
-        (fire-and-forget), so this rarely blocks, but we still guard it
-        in case the socket itself was closed unexpectedly.
-        """
+    def _safe_respond(self) -> None:
+        """Guarded version of client.respond_to_server()."""
         try:
             self.client.respond_to_server()
         except OSError as e:
             raise TorcsCrashError(f"Failed to send action to TORCS: {e}")
 
-    def _wait_for_manual_restart(self, error):
-        """
-        Pause execution and ask the human to manually restart TORCS.
-        Called whenever a TorcsCrashError is raised.
-        """
+    def _wait_for_manual_restart(self, error) -> None:
+        """Pause and prompt the user to manually restart TORCS."""
         print("\n" + "=" * 60)
         print("  TORCS CONNECTION LOST")
         print("=" * 60)
@@ -1089,20 +513,18 @@ class TorcsEnv(gym.Env):
         input("  Press Enter once TORCS is ready... ")
         print("  Resuming...\n")
 
-
-
-    def _send_restart(self):
-        """Send the meta=1 signal telling TORCS to restart the race."""
+    def _send_restart(self) -> None:
+        """Send meta=1 telling TORCS to restart the race."""
         if self.client is None:
             return
         try:
             self.client.R.d["meta"] = True
             self.client.respond_to_server()
         except Exception:
-            pass  # Connection may already be dead -- fine, reset() will reconnect.
-        time.sleep(0.5)  # Give TORCS a moment to process the restart.
+            pass
+        time.sleep(0.5)
 
-    def _disconnect(self):
+    def _disconnect(self) -> None:
         """Close the UDP socket if one is open."""
         if self.client is None:
             return
@@ -1113,20 +535,14 @@ class TorcsEnv(gym.Env):
         self.client = None
 
     # ============================================================
-    #  Cleanup (called when training ends)
+    #  Cleanup
     # ============================================================
 
-    def close(self):
+    def close(self) -> None:
         """Release all resources."""
-        # If a log file is still open, this episode was cut short by the
-        # training run ending (not a real terminal condition). Write a
-        # marker row so the CSV is self-explanatory instead of silently
-        # truncating mid-episode (this caused confusion earlier when a
-        # log file just stopped with no terminal_reason at all).
-        if self._log_writer is not None:
-            self._log_writer.writerow(
-                [self.time_step] + [""] * 20 + ["training_stopped"]
-            )
-        self._close_episode_log()
+        if self._logger is not None:
+            self._logger.log_training_stopped(self.time_step)
+            self._logger.close()
+            self._logger = None
         self._disconnect()
         super().close()
