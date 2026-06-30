@@ -1,0 +1,520 @@
+{
+  "lap_length": 3608.45,
+  "reference_lap_steps": 5939,
+  "reference_lap_time": 125.404,
+  "sector_length": 50.0,
+  "sectors": [
+    {
+      "end": 50.0,
+      "index": 0,
+      "reference_speed": 34.76107800433884,
+      "reference_steps": 242,
+      "start": 0.0
+    },
+    {
+      "end": 100.0,
+      "index": 1,
+      "reference_speed": 83.95182061855672,
+      "reference_steps": 98,
+      "start": 50.0
+    },
+    {
+      "end": 150.0,
+      "index": 2,
+      "reference_speed": 121.0647164179104,
+      "reference_steps": 68,
+      "start": 100.0
+    },
+    {
+      "end": 200.0,
+      "index": 3,
+      "reference_speed": 122.76663380281688,
+      "reference_steps": 72,
+      "start": 150.0
+    },
+    {
+      "end": 250.0,
+      "index": 4,
+      "reference_speed": 113.39957142857148,
+      "reference_steps": 78,
+      "start": 200.0
+    },
+    {
+      "end": 300.0,
+      "index": 5,
+      "reference_speed": 118.9157333333333,
+      "reference_steps": 76,
+      "start": 250.0
+    },
+    {
+      "end": 350.0,
+      "index": 6,
+      "reference_speed": 123.29016666666666,
+      "reference_steps": 73,
+      "start": 300.0
+    },
+    {
+      "end": 400.0,
+      "index": 7,
+      "reference_speed": 121.73030136986304,
+      "reference_steps": 74,
+      "start": 350.0
+    },
+    {
+      "end": 450.0,
+      "index": 8,
+      "reference_speed": 96.24565185185185,
+      "reference_steps": 82,
+      "start": 400.0
+    },
+    {
+      "end": 500.0,
+      "index": 9,
+      "reference_speed": 54.86966544117649,
+      "reference_steps": 137,
+      "start": 450.0
+    },
+    {
+      "end": 550.0,
+      "index": 10,
+      "reference_speed": 55.74955984848485,
+      "reference_steps": 133,
+      "start": 500.0
+    },
+    {
+      "end": 600.0,
+      "index": 11,
+      "reference_speed": 77.53613867924528,
+      "reference_steps": 107,
+      "start": 550.0
+    },
+    {
+      "end": 650.0,
+      "index": 12,
+      "reference_speed": 94.03826588235289,
+      "reference_steps": 86,
+      "start": 600.0
+    },
+    {
+      "end": 700.0,
+      "index": 13,
+      "reference_speed": 85.4667712765957,
+      "reference_steps": 95,
+      "start": 650.0
+    },
+    {
+      "end": 750.0,
+      "index": 14,
+      "reference_speed": 77.40350476190473,
+      "reference_steps": 106,
+      "start": 700.0
+    },
+    {
+      "end": 800.0,
+      "index": 15,
+      "reference_speed": 64.05691250000001,
+      "reference_steps": 121,
+      "start": 750.0
+    },
+    {
+      "end": 850.0,
+      "index": 16,
+      "reference_speed": 58.22344093959729,
+      "reference_steps": 150,
+      "start": 800.0
+    },
+    {
+      "end": 900.0,
+      "index": 17,
+      "reference_speed": 86.40608173076922,
+      "reference_steps": 105,
+      "start": 850.0
+    },
+    {
+      "end": 950.0,
+      "index": 18,
+      "reference_speed": 124.95981690140843,
+      "reference_steps": 72,
+      "start": 900.0
+    },
+    {
+      "end": 1000.0,
+      "index": 19,
+      "reference_speed": 136.8686,
+      "reference_steps": 66,
+      "start": 950.0
+    },
+    {
+      "end": 1050.0,
+      "index": 20,
+      "reference_speed": 133.9041587301587,
+      "reference_steps": 64,
+      "start": 1000.0
+    },
+    {
+      "end": 1100.0,
+      "index": 21,
+      "reference_speed": 118.15915492957748,
+      "reference_steps": 72,
+      "start": 1050.0
+    },
+    {
+      "end": 1150.0,
+      "index": 22,
+      "reference_speed": 119.14026666666668,
+      "reference_steps": 76,
+      "start": 1100.0
+    },
+    {
+      "end": 1200.0,
+      "index": 23,
+      "reference_speed": 146.82838333333336,
+      "reference_steps": 61,
+      "start": 1150.0
+    },
+    {
+      "end": 1250.0,
+      "index": 24,
+      "reference_speed": 146.1640163934426,
+      "reference_steps": 62,
+      "start": 1200.0
+    },
+    {
+      "end": 1300.0,
+      "index": 25,
+      "reference_speed": 136.6144923076923,
+      "reference_steps": 66,
+      "start": 1250.0
+    },
+    {
+      "end": 1350.0,
+      "index": 26,
+      "reference_speed": 147.58338333333333,
+      "reference_steps": 61,
+      "start": 1300.0
+    },
+    {
+      "end": 1400.0,
+      "index": 27,
+      "reference_speed": 138.82676562499998,
+      "reference_steps": 65,
+      "start": 1350.0
+    },
+    {
+      "end": 1450.0,
+      "index": 28,
+      "reference_speed": 126.70070000000001,
+      "reference_steps": 71,
+      "start": 1400.0
+    },
+    {
+      "end": 1500.0,
+      "index": 29,
+      "reference_speed": 114.76381578947367,
+      "reference_steps": 77,
+      "start": 1450.0
+    },
+    {
+      "end": 1550.0,
+      "index": 30,
+      "reference_speed": 102.46473797468354,
+      "reference_steps": 80,
+      "start": 1500.0
+    },
+    {
+      "end": 1600.0,
+      "index": 31,
+      "reference_speed": 89.55030978260866,
+      "reference_steps": 93,
+      "start": 1550.0
+    },
+    {
+      "end": 1650.0,
+      "index": 32,
+      "reference_speed": 77.3626043859649,
+      "reference_steps": 115,
+      "start": 1600.0
+    },
+    {
+      "end": 1700.0,
+      "index": 33,
+      "reference_speed": 94.16057157894735,
+      "reference_steps": 96,
+      "start": 1650.0
+    },
+    {
+      "end": 1750.0,
+      "index": 34,
+      "reference_speed": 125.96716176470588,
+      "reference_steps": 69,
+      "start": 1700.0
+    },
+    {
+      "end": 1800.0,
+      "index": 35,
+      "reference_speed": 128.25093650793647,
+      "reference_steps": 64,
+      "start": 1750.0
+    },
+    {
+      "end": 1850.0,
+      "index": 36,
+      "reference_speed": 128.22715873015872,
+      "reference_steps": 64,
+      "start": 1800.0
+    },
+    {
+      "end": 1900.0,
+      "index": 37,
+      "reference_speed": 131.84783606557377,
+      "reference_steps": 62,
+      "start": 1850.0
+    },
+    {
+      "end": 1950.0,
+      "index": 38,
+      "reference_speed": 127.70493333333333,
+      "reference_steps": 61,
+      "start": 1900.0
+    },
+    {
+      "end": 2000.0,
+      "index": 39,
+      "reference_speed": 111.47499999999995,
+      "reference_steps": 72,
+      "start": 1950.0
+    },
+    {
+      "end": 2050.0,
+      "index": 40,
+      "reference_speed": 99.77018024691357,
+      "reference_steps": 82,
+      "start": 2000.0
+    },
+    {
+      "end": 2100.0,
+      "index": 41,
+      "reference_speed": 91.87288977272729,
+      "reference_steps": 89,
+      "start": 2050.0
+    },
+    {
+      "end": 2150.0,
+      "index": 42,
+      "reference_speed": 120.35308955223879,
+      "reference_steps": 68,
+      "start": 2100.0
+    },
+    {
+      "end": 2200.0,
+      "index": 43,
+      "reference_speed": 142.4566842105263,
+      "reference_steps": 58,
+      "start": 2150.0
+    },
+    {
+      "end": 2250.0,
+      "index": 44,
+      "reference_speed": 136.88867241379305,
+      "reference_steps": 59,
+      "start": 2200.0
+    },
+    {
+      "end": 2300.0,
+      "index": 45,
+      "reference_speed": 142.7669298245614,
+      "reference_steps": 58,
+      "start": 2250.0
+    },
+    {
+      "end": 2350.0,
+      "index": 46,
+      "reference_speed": 135.50849152542372,
+      "reference_steps": 60,
+      "start": 2300.0
+    },
+    {
+      "end": 2400.0,
+      "index": 47,
+      "reference_speed": 122.10449230769225,
+      "reference_steps": 66,
+      "start": 2350.0
+    },
+    {
+      "end": 2450.0,
+      "index": 48,
+      "reference_speed": 116.50548529411768,
+      "reference_steps": 69,
+      "start": 2400.0
+    },
+    {
+      "end": 2500.0,
+      "index": 49,
+      "reference_speed": 62.23681788617888,
+      "reference_steps": 124,
+      "start": 2450.0
+    },
+    {
+      "end": 2550.0,
+      "index": 50,
+      "reference_speed": 57.51412631578947,
+      "reference_steps": 134,
+      "start": 2500.0
+    },
+    {
+      "end": 2600.0,
+      "index": 51,
+      "reference_speed": 72.21492321428572,
+      "reference_steps": 113,
+      "start": 2550.0
+    },
+    {
+      "end": 2650.0,
+      "index": 52,
+      "reference_speed": 101.1490506329114,
+      "reference_steps": 80,
+      "start": 2600.0
+    },
+    {
+      "end": 2700.0,
+      "index": 53,
+      "reference_speed": 95.51632716049386,
+      "reference_steps": 82,
+      "start": 2650.0
+    },
+    {
+      "end": 2750.0,
+      "index": 54,
+      "reference_speed": 89.68854523809526,
+      "reference_steps": 85,
+      "start": 2700.0
+    },
+    {
+      "end": 2800.0,
+      "index": 55,
+      "reference_speed": 85.12805,
+      "reference_steps": 91,
+      "start": 2750.0
+    },
+    {
+      "end": 2850.0,
+      "index": 56,
+      "reference_speed": 87.69555760869568,
+      "reference_steps": 93,
+      "start": 2800.0
+    },
+    {
+      "end": 2900.0,
+      "index": 57,
+      "reference_speed": 117.8400579710145,
+      "reference_steps": 70,
+      "start": 2850.0
+    },
+    {
+      "end": 2950.0,
+      "index": 58,
+      "reference_speed": 119.80014925373138,
+      "reference_steps": 68,
+      "start": 2900.0
+    },
+    {
+      "end": 3000.0,
+      "index": 59,
+      "reference_speed": 110.17219117647058,
+      "reference_steps": 69,
+      "start": 2950.0
+    },
+    {
+      "end": 3050.0,
+      "index": 60,
+      "reference_speed": 99.52647402597401,
+      "reference_steps": 78,
+      "start": 3000.0
+    },
+    {
+      "end": 3100.0,
+      "index": 61,
+      "reference_speed": 105.15762467532467,
+      "reference_steps": 78,
+      "start": 3050.0
+    },
+    {
+      "end": 3150.0,
+      "index": 62,
+      "reference_speed": 131.75145901639343,
+      "reference_steps": 62,
+      "start": 3100.0
+    },
+    {
+      "end": 3200.0,
+      "index": 63,
+      "reference_speed": 128.3077301587302,
+      "reference_steps": 64,
+      "start": 3150.0
+    },
+    {
+      "end": 3250.0,
+      "index": 64,
+      "reference_speed": 122.86469696969701,
+      "reference_steps": 67,
+      "start": 3200.0
+    },
+    {
+      "end": 3300.0,
+      "index": 65,
+      "reference_speed": 69.6468009174312,
+      "reference_steps": 110,
+      "start": 3250.0
+    },
+    {
+      "end": 3350.0,
+      "index": 66,
+      "reference_speed": 84.71915000000003,
+      "reference_steps": 97,
+      "start": 3300.0
+    },
+    {
+      "end": 3400.0,
+      "index": 67,
+      "reference_speed": 131.282868852459,
+      "reference_steps": 62,
+      "start": 3350.0
+    },
+    {
+      "end": 3450.0,
+      "index": 68,
+      "reference_speed": 162.74114,
+      "reference_steps": 51,
+      "start": 3400.0
+    },
+    {
+      "end": 3500.0,
+      "index": 69,
+      "reference_speed": 172.55084782608694,
+      "reference_steps": 47,
+      "start": 3450.0
+    },
+    {
+      "end": 3550.0,
+      "index": 70,
+      "reference_speed": 172.60743478260872,
+      "reference_steps": 47,
+      "start": 3500.0
+    },
+    {
+      "end": 3600.0,
+      "index": 71,
+      "reference_speed": 172.06744680851065,
+      "reference_steps": 48,
+      "start": 3550.0
+    },
+    {
+      "end": 3608.45,
+      "index": 72,
+      "reference_speed": 166.86714285714288,
+      "reference_steps": 8,
+      "start": 3600.0
+    }
+  ],
+  "source": "runs\\20260630_050228_profile_v2_12_finish_brake_170\\telemetry_episode_0.csv"
+}

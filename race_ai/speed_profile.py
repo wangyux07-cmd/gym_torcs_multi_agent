@@ -63,7 +63,13 @@ class SpeedProfile:
             "max_multiplier": self.max_multiplier,
             "caution_multiplier": self.caution_multiplier,
             "segments": [
-                {"start": item.start, "end": item.end, "multiplier": item.multiplier, "name": item.name}
+                {
+                    "start": item.start,
+                    "end": item.end,
+                    "multiplier": item.multiplier,
+                    "name": item.name,
+                    "brake_multiplier": item.brake_multiplier,
+                }
                 for item in self.segments
             ],
         }
