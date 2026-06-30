@@ -61,6 +61,14 @@ Offtrack/backward failures always receive a base failure penalty. High-speed off
 python race_sector_policy_driver.py --model models\sector_sac_speed_only\final_model.zip --episodes 3
 ```
 
+Current best stable checkpoint:
+
+```powershell
+python race_sector_policy_driver.py --model models\best\sector_sac_best_stable.zip --episodes 3
+```
+
+This model is copied from `models\sector_sac_straightboost_v1\checkpoints\sector_sac_1000_steps.zip`. Later training in that run stayed complete but became slower, so the early checkpoint is preferred over `final_model.zip`.
+
 Acceptance checks:
 
 - `reason=target_laps` on every episode

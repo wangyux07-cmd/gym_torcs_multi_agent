@@ -140,6 +140,23 @@ class SectorResidualEnv(gym.Env):
             return 1.0
         return None
 
+    def _sector_speed_floor(self, sector_index: int) -> float | None:
+        # Safe straight/exit sectors from telemetry: low edge risk, low heading,
+        # and no recent unsafe posture. Floors only apply below the safety cap.
+        floors = {
+            13: 1.10,
+            24: 1.22,
+            25: 1.22,
+            40: 1.10,
+            41: 1.30,
+            42: 1.30,
+            51: 1.08,
+            56: 1.18,
+            67: 1.40,
+            70: 1.40,
+        }
+        return floors.get(sector_index)
+
     def _safety_cap(self, sensors: dict[str, Any], rule_steer: float) -> float:
         track = list(sensors.get("track", [200.0] * 19))
         ahead = float(track[9])
@@ -180,7 +197,12 @@ class SectorResidualEnv(gym.Env):
         base_multiplier = self.profile.raw_multiplier(profile_distance)
         desired_multiplier = base_multiplier + speed_action * self.speed_delta
         desired_multiplier = clip(desired_multiplier, self.min_speed_multiplier, self.max_speed_multiplier)
-        desired_multiplier = min(desired_multiplier, self._safety_cap(sensors, rule_action.steer))
+        sector = self.reference.sector_for_distance(self._distance(sensors))
+        safety_cap = self._safety_cap(sensors, rule_action.steer)
+        desired_multiplier = min(desired_multiplier, safety_cap)
+        speed_floor = self._sector_speed_floor(sector.index)
+        if speed_floor is not None:
+            desired_multiplier = max(desired_multiplier, min(speed_floor, safety_cap))
 
         base_brake_speed = self.config.brake_target_speed * self.profile.brake_multiplier(profile_distance)
         desired_brake_speed = base_brake_speed + brake_action * self.brake_delta_kmh
@@ -290,6 +312,7 @@ class SectorResidualEnv(gym.Env):
         speed_action = 0.0
         brake_action = 0.0
         sector_entry_cap = self._sector_entry_cap(sector.index)
+        sector_speed_floor = self._sector_speed_floor(sector.index)
         reason: str | None = None
 
         while True:
@@ -431,6 +454,7 @@ class SectorResidualEnv(gym.Env):
             "angle": float(self.sensors.get("angle", 0.0)),
             "speed_multiplier": float(speed_multiplier),
             "sector_entry_cap": "" if sector_entry_cap is None else float(sector_entry_cap),
+            "sector_speed_floor": "" if sector_speed_floor is None else float(sector_speed_floor),
             "brake_target_speed": float(brake_target_speed),
             "speed_delta_action": speed_delta,
             "brake_delta_action": brake_delta,
