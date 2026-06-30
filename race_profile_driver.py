@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=3001)
     parser.add_argument("--config", default="configs/rule_fast.json")
-    parser.add_argument("--profile", default="configs/speed_profile_faster.json")
+    parser.add_argument("--profile", default="configs/speed_profile_v2_12_finish_brake_170.json")
     parser.add_argument("--run-name", default="profile_driver")
     parser.add_argument("--runs-dir", default="runs")
     parser.add_argument("--episodes", type=int, default=1)
@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stuck-steps-limit", type=int, default=300)
     parser.add_argument("--print-every", type=int, default=250)
     parser.add_argument("--telemetry", action="store_true")
+    parser.add_argument(
+        "--profile-brake-speed",
+        action="store_true",
+        help="Scale the high-speed brake threshold with the active speed profile multiplier.",
+    )
+    parser.add_argument("--max-brake-target-speed", type=float, default=160.0)
     return parser.parse_args()
 
 
@@ -64,6 +70,7 @@ def telemetry_writer(run_dir: Path, episode: int):
         "brake",
         "gear",
         "multiplier",
+        "brake_target_speed",
         "damage",
     ]
     writer = csv.DictWriter(fh, fieldnames=fields)
@@ -109,11 +116,17 @@ def run_episode(
             previous_accel = float(client.R.d.get("accel", 0.0))
             base_action = driver.act(sensors, previous_accel=previous_accel)
             multiplier = profile.safe_multiplier(sensors, base_action.steer)
+            brake_target_speed = None
+            if args.profile_brake_speed:
+                distance_for_profile = float(sensors.get("distFromStart", sensors.get("distRaced", 0.0)))
+                brake_multiplier = profile.brake_multiplier(distance_for_profile)
+                brake_target_speed = min(driver.config.brake_target_speed * brake_multiplier, args.max_brake_target_speed)
             action = driver.act_with_steer(
                 sensors,
                 steer=base_action.steer,
                 previous_accel=previous_accel,
                 target_speed_multiplier=multiplier,
+                brake_target_speed=brake_target_speed,
             )
 
             client.R.d["steer"] = action.steer
@@ -137,6 +150,7 @@ def run_episode(
                         "brake": action.brake,
                         "gear": action.gear,
                         "multiplier": multiplier,
+                        "brake_target_speed": brake_target_speed if brake_target_speed is not None else driver.config.brake_target_speed,
                         "damage": float(sensors.get("damage", 0.0)),
                     }
                 )

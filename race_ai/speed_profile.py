@@ -14,6 +14,7 @@ class SpeedSegment:
     end: float
     multiplier: float
     name: str = ""
+    brake_multiplier: float = 1.0
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "SpeedSegment":
@@ -22,6 +23,7 @@ class SpeedSegment:
             end=float(payload["end"]),
             multiplier=float(payload["multiplier"]),
             name=str(payload.get("name", "")),
+            brake_multiplier=float(payload.get("brake_multiplier", 1.0)),
         )
 
     def contains(self, distance: float, lap_length: float) -> bool:
@@ -66,11 +68,23 @@ class SpeedProfile:
             ],
         }
 
-    def raw_multiplier(self, distance: float) -> float:
+    def segment_at(self, distance: float) -> SpeedSegment | None:
         for segment in self.segments:
             if segment.contains(distance, self.lap_length):
-                return clip(segment.multiplier, self.min_multiplier, self.max_multiplier)
+                return segment
+        return None
+
+    def raw_multiplier(self, distance: float) -> float:
+        segment = self.segment_at(distance)
+        if segment is not None:
+            return clip(segment.multiplier, self.min_multiplier, self.max_multiplier)
         return clip(self.default_multiplier, self.min_multiplier, self.max_multiplier)
+
+    def brake_multiplier(self, distance: float) -> float:
+        segment = self.segment_at(distance)
+        if segment is not None:
+            return max(1.0, segment.brake_multiplier)
+        return 1.0
 
     def safe_multiplier(self, sensors: Mapping[str, Any], rule_steer: float) -> float:
         distance = float(sensors.get("distFromStart", sensors.get("distRaced", 0.0))) % self.lap_length
@@ -84,11 +98,11 @@ class SpeedProfile:
         steer_abs = abs(rule_steer)
 
         caution_cap = max(self.min_multiplier, min(1.0, self.caution_multiplier))
-        if angle_abs > 0.55 or track_pos_abs > 0.72:
+        if angle_abs > 0.55 or track_pos_abs > 0.78:
             return min(desired, caution_cap)
-        if ahead < 45.0 or side_clearance < 14.0 or steer_abs > 0.28 or angle_abs > 0.36 or track_pos_abs > 0.55:
+        if ahead < 45.0 or side_clearance < 14.0 or steer_abs > 0.28 or angle_abs > 0.36 or track_pos_abs > 0.65:
             return min(desired, 1.0)
-        if ahead < 75.0 or side_clearance < 24.0 or steer_abs > 0.18 or angle_abs > 0.24 or track_pos_abs > 0.38:
+        if ahead < 75.0 or side_clearance < 24.0 or steer_abs > 0.18 or angle_abs > 0.24 or track_pos_abs > 0.50:
             return min(desired, 1.04)
         return desired
 

@@ -67,10 +67,11 @@ class RuleBasedDriver:
         sensors: Mapping[str, Any],
         previous_accel: float = 0.0,
         target_speed_multiplier: float = 1.0,
+        brake_target_speed: float | None = None,
     ) -> DriverAction:
         steer = self._steer(sensors)
         accel = self._throttle(sensors, steer, previous_accel, target_speed_multiplier=target_speed_multiplier)
-        brake = self._brake(sensors)
+        brake = self._brake(sensors, brake_target_speed=brake_target_speed)
         if brake > 0.0:
             accel = 0.0
         accel = self._traction_control(sensors, accel)
@@ -83,9 +84,10 @@ class RuleBasedDriver:
         steer: float,
         previous_accel: float = 0.0,
         target_speed_multiplier: float = 1.0,
+        brake_target_speed: float | None = None,
     ) -> DriverAction:
         accel = self._throttle(sensors, steer, previous_accel, target_speed_multiplier=target_speed_multiplier)
-        brake = self._brake(sensors)
+        brake = self._brake(sensors, brake_target_speed=brake_target_speed)
         if brake > 0.0:
             accel = 0.0
         accel = self._traction_control(sensors, accel)
@@ -155,12 +157,13 @@ class RuleBasedDriver:
             accel += 1.0 / (speed_x + 0.1)
         return clip(accel, 0.0, 1.0)
 
-    def _brake(self, sensors: Mapping[str, Any]) -> float:
+    def _brake(self, sensors: Mapping[str, Any], brake_target_speed: float | None = None) -> float:
         cfg = self.config
         speed_x = float(sensors.get("speedX", 0.0))
         track = list(sensors.get("track", [200.0] * 19))
         center_distance = sum(float(track[i]) for i in (8, 9, 10)) / 3.0
-        too_fast = speed_x - cfg.brake_speed_margin > cfg.brake_target_speed
+        target_speed = cfg.brake_target_speed if brake_target_speed is None else brake_target_speed
+        too_fast = speed_x - cfg.brake_speed_margin > target_speed
         blind_corner = center_distance < cfg.brake_track_distance and speed_x > cfg.brake_min_speed
         return cfg.brake_amount if too_fast or blind_corner else 0.0
 
