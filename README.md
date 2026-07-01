@@ -1,94 +1,163 @@
-# Gym-TORCS
+# RaceYourCode — AI TORCS Driver
 
-Gym-TORCS is the reinforcement learning (RL) environment in TORCS domain with OpenAI-gym-like interface.
-TORCS is the open-rource realistic car racing simulator recently used as RL benchmark task in several AI studies.
+An AI racing platform built on [TORCS](https://torcs.sourceforge.net/). A rule-based controller provides a stable, fast baseline; residual RL layers (PPO and SAC) learn to push lap times further without sacrificing stability.
 
-Gym-TORCS is the python wrapper of TORCS for RL experiment with the simple interface (similar, but not fully) compatible with OpenAI-gym environments. The current implementaion is for only the single-track race in practie mode. If you want to use multiple tracks or other racing mode (quick race etc.), you may need to modify the environment, "autostart.sh" or the race configuration file using GUI of TORCS.
+A web interface lets multiple users race the AI, track per-driver results, and compare lap times on a shared leaderboard.
 
-This code is developed based on vtorcs (https://github.com/giuse/vtorcs)
-and python-client for torcs (http://xed.ch/project/snakeoil/index.html).
+---
 
-The detailed explanation of original TORCS for AI research is given by Daniele Loiacono et al. (https://arxiv.org/pdf/1304.1672.pdf)
+## Quick Start
 
-Because torcs has memory leak bug at race reset.
-As an ad-hoc solution, we relaunch and automate the gui setting in torcs.
-Any better solution is welcome!
+### Web Interface
 
-# Requirements
-We are assuming you are using Ubuntu 14.04 LTS/16.04 LTS machine and installed
-* Python 3
-* xautomation (http://linux.die.net/man/7/xautomation)
-* OpenAI-Gym (https://github.com/openai/gym)
-* numpy
-* vtorcs-RL-color (installation of vtorcs-RL-color is explained in vtorcs-RL-color directory)
-
-# Example Code
-The example code and agent are written in example_experiment.py and sample_agent.py.
-
-# Initialization of the Race
-After the insallation of vtorcs-RL-color, you need to initialize the race setting. You can find the detailed explanation in a document (https://arxiv.org/pdf/1304.1672.pdf), but here I show the simple gui-based setting.
-
-So first you need to run
-```
-sudo torcs
-```
-in the terminal, the GUI of TORCS should be launched.
-Then, you need to choose the race track by following the GUI (Race --> Practice --> Configure Race) and open TORCS server by selecting Race --> Practice --> New Race. This should result that TORCS keeps a blue screen with several text information.
-
-If you need to treat the vision input in your AI agent, you have to set the small image size in TORCS. To do so, you have to run
-```
-python snakeoil3_gym.py
-```
-in the second terminal window after you open the TORCS server (just as written above). Then the race starts, and you can select the driving-window mode by F2 key during the race.
-
-After the selection of the driving-window mode, you need to set the appropriate gui size. This is done by using the display option mode in Options --> Display. You can select the Screen Resolution, and you need to select 64x64 for visual input (our immplementation only support this screen size, other screen size results the unreasonable visual information). Then, you need to shut down TORCS to complete the configuration for the vision treatment.
-
-
-# Simple How-To
-
-```python
-from gym_torcs import TorcsEnv
-
-#### Generate a Torcs environment
-# enable vision input, the action is steering only (1 dim continuous action)
-env = TorcsEnv(vision=True, throttle=False)
-
-# without vision input, the action is steering and throttle (2 dim continuous action)
-# env = TorcsEnv(vision=False, throttle=True)
-
-ob = env.reset(relaunch=True)  # with torcs relaunch (avoid memory leak bug in torcs)
-# ob = env.reset()  # without torcs relaunch
-
-# Generate an agent
-from sample_agent import Agent
-agent = Agent(1)  # steering only
-action = agent.act(ob, reward, done, vision=True)
-
-# single step
-ob, reward, done, _ = env.step(action)
-
-# shut down torcs
-env.end()
+```bash
+pip install -r requirements-web.txt
+python run_web_app.py
 ```
 
-# 
+Open **http://127.0.0.1:8000**, enter your name in Garage, set the TORCS simulator path, then click **Launch TORCS → Race Now**.
 
-# Add Noise in Low-dim Sensors
+### Command Line
 
-If you want to apply sensor noise in low-dimensional sensors, you should 
-
-```
-os.system('torcs -nofuel -nodamage -nolaptime -vision -noisy &')
-os.system('torcs -nofuel -nolaptime -noisy &')
+```bash
+# Start TORCS and wait for the blue "Waiting for driver" screen, then:
+python race_rule_driver.py --target-laps 1 --episodes 1
 ```
 
-at 33 & 35th lines in gym_torcs.py
+---
 
-# Great Application
-gym-torcs was utilized in DDPG experiment with Keras by Ben Lau. 
-This experiment is really great!
+## Requirements
 
-https://yanpanlau.github.io/2016/10/11/Torcs-Keras.html
+| Component | Notes |
+|-----------|-------|
+| Python 3.10+ | |
+| TORCS with SCR server (`wtorcs.exe`) | Windows build with `scr_server` driver module |
+| `requirements-web.txt` | Web interface (FastAPI, uvicorn, mss, pywin32) |
+| `requirements-rl.txt` | RL training and inference (stable-baselines3, gymnasium, torch) |
 
-# Acknowledgement
-gym_torcs was developed during the spring internship 2016 at Preferred Networks.
+---
+
+## Project Structure
+
+```
+gym_torcs/
+├── race_ai/
+│   ├── controller.py            Rule-based driver (PID steering, heuristic throttle/brake)
+│   ├── residual_env.py          Gymnasium env for PPO residual training
+│   ├── sector_residual_env.py   Gymnasium env for SAC sector-level training
+│   ├── speed_profile.py         Distance-indexed speed multiplier profiles
+│   ├── sector_reference.py      Reference lap split into 50 m sectors
+│   ├── metrics.py               Episode telemetry writer (CSV + JSONL)
+│   ├── train_residual.py        PPO training entry point
+│   ├── train_sector_sac.py      SAC training entry point
+│   └── tune.py                  Optuna hyperparameter search for the rule controller
+├── web_app/
+│   ├── backend/                 FastAPI REST API + TORCS process management
+│   └── frontend/                Single-page app (vanilla JS, no build step)
+├── configs/
+│   ├── rule_fast.json           Default rule controller parameters
+│   ├── rule_tuned.json          Optuna-tuned variant
+│   ├── speed_profile_*.json     Distance-based speed multipliers
+│   └── sector_reference_*.json  Reference lap sector data
+├── models/                      Trained PPO and SAC checkpoints
+├── race_rule_driver.py          CLI: rule-based driver
+├── race_profile_driver.py       CLI: rule driver + speed profile
+├── race_residual_driver.py      CLI: rule driver + PPO residual correction
+├── race_sector_policy_driver.py CLI: rule driver + SAC sector policy
+├── build_sector_reference.py    Build sector reference JSON from a telemetry CSV
+├── eval_residual_env_baseline.py  Validate the env with zero RL action (sanity check)
+├── snakeoil3_gym.py             TORCS UDP client (Chris X Edwards)
+└── run_web_app.py               Launch web server
+```
+
+---
+
+## Drivers
+
+### Rule-based (`race_rule_driver.py`)
+
+PID steering with look-ahead track sensors, heuristic throttle, blind-corner braking, and rear-wheel traction control. All tunable parameters live in `configs/rule_fast.json`.
+
+```bash
+python race_rule_driver.py --config configs/rule_fast.json --target-laps 1
+```
+
+### Speed Profile (`race_profile_driver.py`)
+
+Rule driver with a distance-indexed speed multiplier map. Specific track sections can run faster or slower than the base rule speed.
+
+```bash
+python race_profile_driver.py --profile configs/speed_profile_v3.json --telemetry
+```
+
+### Residual PPO (`race_residual_driver.py`)
+
+A trained PPO policy outputs a speed multiplier that replaces the rule controller's target speed. Steering and braking remain rule-based; safety caps prevent the policy from exceeding safe limits.
+
+```bash
+python race_residual_driver.py \
+  --model models/residual_ppo/final_model.zip \
+  --action-mode speed_target
+```
+
+### Sector SAC (`race_sector_policy_driver.py`)
+
+SAC acts once per 50 m track sector and adjusts a small speed offset on top of the speed profile. High-risk sectors can be locked so the policy cannot modify them.
+
+```bash
+python race_sector_policy_driver.py \
+  --model models/best/sector_sac_best_stable.zip \
+  --locked-sectors 44-50,61-66
+```
+
+---
+
+## Training
+
+### Tune the rule controller (Optuna)
+
+```bash
+python -m race_ai.tune --trials 30 --best-config-out configs/rule_tuned.json
+```
+
+### Train residual PPO
+
+```bash
+python -m race_ai.train_residual --total-timesteps 200000 --out-dir models/my_ppo
+```
+
+### Train sector SAC
+
+```bash
+python -m race_ai.train_sector_sac --total-timesteps 500000 --out-dir models/my_sac
+```
+
+---
+
+## Configuration
+
+| File | What it controls |
+|------|-----------------|
+| `configs/rule_fast.json` | kp/kd gains, target speeds, brake thresholds, gear shift points |
+| `configs/speed_profile_*.json` | Per-segment multipliers; `default_multiplier` applies off-segment |
+| `configs/sector_reference_*.json` | Reference steps per 50 m sector; drives SAC reward shaping |
+
+### Building a sector reference
+
+Collect a telemetry lap first, then convert it:
+
+```bash
+python race_profile_driver.py --telemetry --episodes 1 --target-laps 1
+
+python build_sector_reference.py \
+  --telemetry runs/<run_id>/telemetry_episode_0.csv \
+  --out configs/sector_reference_new.json
+```
+
+---
+
+## Acknowledgements
+
+- `snakeoil3_gym.py` — TORCS UDP client adapted from [Chris X Edwards](http://xed.ch/project/snakeoil/).
+- Simulator: [TORCS](https://torcs.sourceforge.net/) with SCR server extensions.
+- Original gym wrapper: [gym_torcs](https://github.com/ugo-nama-kun/gym_torcs) (Preferred Networks, 2016).

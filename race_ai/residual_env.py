@@ -307,10 +307,7 @@ class ResidualDriverEnv(gym.Env):
 
     def close(self) -> None:
         if self.client is not None:
-            # training can stop mid-episode (total_timesteps reached without
-            # the in-progress episode hitting a terminal/truncated state), in
-            # which case step() never got to send the closing meta=1. Send it
-            # here too, otherwise we disconnect mid-race and TORCS can exit.
+            # send meta=1 in case training stopped mid-episode before step() sent it
             self.client.R.d["meta"] = 1
             self.client.respond_to_server()
             self.client.shutdown()
