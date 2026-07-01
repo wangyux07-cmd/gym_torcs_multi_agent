@@ -4,3 +4,5 @@ __pycache__/
 models/
 runs/
 .idea/
+web_app/data/results.json
+web_app/data/settings.json

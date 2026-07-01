@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Race Control</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">AI Race Control</p>
+          <h1>Race Now</h1>
+        </div>
+        <div class="status-pill" id="statusPill">Ready</div>
+      </header>
+
+      <main class="main-grid">
+        <section class="race-stage">
+          <div class="race-copy">
+            <p class="eyebrow">Race Setup</p>
+            <h2 id="heroTitle">AI Driver Ready</h2>
+            <p id="heroMessage">Select a track and click Race Now. TORCS will open automatically.</p>
+          </div>
+
+          <div class="setup-form">
+            <div class="form-row">
+              <div class="form-group">
+                <label for="trackSelect">Track</label>
+                <select id="trackSelect" class="setup-select">
+                  <option value="road|corkscrew">Corkscrew</option>
+                </select>
+              </div>
+              <div class="form-group form-group--narrow">
+                <label for="lapsInput">Laps</label>
+                <input id="lapsInput" class="setup-input" type="number" min="1" max="20" value="1" />
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="driverConfig">AI Setup</label>
+                <select id="driverConfig" class="setup-select">
+                  <option value="configs/rule_fast.json">Rule Fast (Default)</option>
+                  <option value="configs/rule_tuned.json">Rule Tuned (Optimized)</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="race-actions">
+            <button class="primary-action" id="raceButton" type="button">Race Now</button>
+            <button class="ghost-action" id="stopButton" type="button">Stop</button>
+            <button class="ghost-action" id="launchButton" type="button">Launch TORCS Only</button>
+          </div>
+
+          <div class="progress-wrap">
+            <div class="progress-meta">
+              <span>Lap Progress</span>
+              <strong id="progressText">0%</strong>
+            </div>
+            <div class="progress-track">
+              <div id="progressBar"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="hud-panel">
+          <div class="panel-title">
+            <span>Live Race</span>
+            <small id="runId">No active run</small>
+          </div>
+          <div class="metric-grid">
+            <div class="metric">
+              <span>Lap Time</span>
+              <strong id="lapTime">--</strong>
+            </div>
+            <div class="metric">
+              <span>Distance</span>
+              <strong id="distance">0 m</strong>
+            </div>
+            <div class="metric">
+              <span>Speed</span>
+              <strong id="speed">--</strong>
+            </div>
+            <div class="metric">
+              <span>Step</span>
+              <strong id="step">--</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="garage-panel">
+          <div class="panel-title">
+            <span>Garage</span>
+            <small>Auto-selected</small>
+          </div>
+          <div class="car-card">
+            <div class="car-silhouette"></div>
+            <div>
+              <h3 id="setupName">Rule Fast</h3>
+              <p id="garageStatus">Ready and ready</p>
+            </div>
+          </div>
+          <div class="garage-stats">
+            <div>
+              <span>Best Lap</span>
+              <strong id="bestLap">--</strong>
+            </div>
+            <div>
+              <span>Reliability</span>
+              <strong id="reliability">Stable</strong>
+            </div>
+          </div>
+          <div class="driver-profile">
+            <label for="driverName">Your Name</label>
+            <div class="path-row">
+              <input id="driverName" type="text" placeholder="Enter your name" maxlength="32" />
+              <button class="ghost-action compact-action" id="saveName" type="button">Save</button>
+            </div>
+          </div>
+          <div class="sim-settings">
+            <label for="torcsPath">Simulator Path</label>
+            <div class="path-row">
+              <input id="torcsPath" type="text" placeholder="D:\torcs\wtorcs.exe" />
+              <button class="ghost-action compact-action" id="saveSettings" type="button">Save</button>
+            </div>
+            <label for="torcsArgs">Launch Options</label>
+            <input id="torcsArgs" type="text" placeholder="-nofuel -nodamage -nolaptime" />
+          </div>
+        </section>
+
+        <section class="leaderboard-panel">
+          <div class="panel-title">
+            <span>Leaderboard</span>
+            <small>All drivers</small>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Driver</th>
+                  <th>Best Lap</th>
+                  <th>Races</th>
+                </tr>
+              </thead>
+              <tbody id="leaderboardRows">
+                <tr><td colspan="4">No results yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="result-modal" id="resultModal" hidden>
+      <div class="result-card">
+        <button class="modal-close" id="closeResult" type="button">Done</button>
+        <p class="eyebrow" id="resultBadge">Result</p>
+        <h2 id="resultTitle">Race Complete</h2>
+        <div class="result-metrics">
+          <div>
+            <span>Lap Time</span>
+            <strong id="resultLap">--</strong>
+          </div>
+          <div>
+            <span>Distance</span>
+            <strong id="resultDistance">0 m</strong>
+          </div>
+        </div>
+        <div class="result-actions">
+          <button class="primary-action" id="raceAgain" type="button">Race Again</button>
+          <button class="ghost-action" id="viewResults" type="button">View Results</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

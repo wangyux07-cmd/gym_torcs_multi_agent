@@ -1,0 +1,29 @@
+{
+  "accel_down_step": 0.2157933166606164,
+  "accel_target_distance": 56.33585430300612,
+  "accel_up_step": 0.7963723957442327,
+  "brake_amount": 0.38276701121774215,
+  "brake_min_speed": 40.139601277733036,
+  "brake_speed_margin": 5.0,
+  "brake_target_speed": 140.0,
+  "brake_track_distance": 37.780136343921356,
+  "center_weight": 0.6237323878351343,
+  "corner_speed": 50.699007565833256,
+  "gear_speeds": [
+    0.0,
+    20.0,
+    40.0,
+    80.0,
+    100.0,
+    180.0
+  ],
+  "kd": 0.2747268576211602,
+  "kp": 0.2870562105362474,
+  "launch_speed": 10.0,
+  "sharp_turn_distance": 51.0,
+  "side_turn_distance": 18.0,
+  "steer_limit": 1.0,
+  "straight_speed": 199.1627128785471,
+  "traction_accel_reduction": 0.1,
+  "traction_slip_limit": 2.0
+}
