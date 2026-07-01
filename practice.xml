@@ -58,6 +58,7 @@
   </section>
 
   <section name="Configuration">
+    <!-- current_configuration=4 skips track/driver/lap wizard and shows New Race directly -->
     <attnum name="current configuration" val="4"/>
     <section name="1">
       <attstr name="type" val="track select"/>

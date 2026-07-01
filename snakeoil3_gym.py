@@ -3,7 +3,7 @@
 # Chris X Edwards <snakeoil@xed.ch>
 # Snake Oil is a Python library for interfacing with a TORCS
 # race car simulator which has been patched with the server
-# extentions used in the Simulated Car Racing competitions.
+# extensions used in the Simulated Car Racing competitions.
 # http://scr.geccocompetitions.com/
 #
 # To use it, you must import it and create a "drive()" function.
@@ -76,7 +76,7 @@ ophelp+= ' --help, -h           Show this help.\n'
 ophelp+= ' --version, -v        Show current version.'
 usage= 'Usage: %s [ophelp [optargs]] \n' % sys.argv[0]
 usage= usage + ophelp
-version= "20130505-2"
+version= "20260701-1"
 
 def clip(v,lo,hi):
     if v<lo: return lo
